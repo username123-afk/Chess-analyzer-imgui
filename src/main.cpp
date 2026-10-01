@@ -21,28 +21,327 @@
 #include "vision.h"
 #include "chess_core.h"
 
-static EGLDisplay gd=EGL_NO_DISPLAY; static EGLSurface gs=EGL_NO_SURFACE; static EGLContext gc=EGL_NO_CONTEXT; static ANativeWindow* gw=nullptr;
-static const char* STATE="/data/adb/chess_analyzer/run/analysis.json"; static const char* STOCK="/data/local/tmp/stockfish-android-arm64"; static const char* LEARN="/data/adb/chess_analyzer/run/templates.bin";
-struct SF { pid_t pid=-1; int in=-1,out=-1; std::string linebuf; bool start(){int a[2],b[2];if(pipe(a)||pipe(b))return false;pid=fork();if(pid==0){dup2(a[0],0);dup2(b[1],1);dup2(b[1],2);close(a[1]);close(b[0]);execl(STOCK,STOCK,(char*)nullptr);_exit(127);}close(a[0]);close(b[1]);in=a[1];out=b[0];fcntl(out,F_SETFL,O_NONBLOCK);send("uci");return wait("uciok",3000);} bool send(const std::string&s){if(in<0)return false;std::string x=s+"\n";return write(in,x.data(),x.size())==(ssize_t)x.size();}bool wait(const std::string&needle,int ms,std::string*all=nullptr){auto t=std::chrono::steady_clock::now();std::string s;char b[4096];while(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t).count()<ms){ssize_t n=read(out,b,sizeof(b));if(n>0){s.append(b,n);if(s.find(needle)!=std::string::npos){if(all)*all=s;return true;}}usleep(5000);}if(all)*all=s;return false;}void stop(){if(pid>0){send("quit");waitpid(pid,nullptr,0);}if(in>=0)close(in);if(out>=0)close(out);pid=-1;in=out=-1;}};
-static bool root(){return geteuid()==0;}
-static bool mkdirs(){mkdir("/data/adb/chess_analyzer",0755);mkdir("/data/adb/chess_analyzer/run",0755);return access("/data/adb/chess_analyzer/run",W_OK)==0;}
-static bool capture(vision::Image& im,std::string&err){FILE*p=popen("/system/bin/screencap","r");if(!p){err="screencap unavailable";return false;}std::vector<uint8_t>b;uint8_t x[65536];size_t n;while((n=fread(x,1,sizeof(x),p))>0)b.insert(b.end(),x,x+n);int rc=pclose(p);if(rc!=0){err="screencap failed";return false;}return vision::parseRawScreencap(b,im,err);}
-static bool eglInit(ANativeWindow*w,int W,int H){gd=eglGetDisplay(EGL_DEFAULT_DISPLAY);if(gd==EGL_NO_DISPLAY||!eglInitialize(gd,nullptr,nullptr))return false;const EGLint a[]={EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,8,EGL_NONE};EGLConfig c;EGLint n;if(!eglChooseConfig(gd,a,&c,1,&n)||n!=1)return false;const EGLint ca[]={EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};gc=eglCreateContext(gd,c,EGL_NO_CONTEXT,ca);gs=eglCreateWindowSurface(gd,c,w,nullptr);if(gc==EGL_NO_CONTEXT||gs==EGL_NO_SURFACE||!eglMakeCurrent(gd,gs,gs,gc))return false;glViewport(0,0,W,H);return true;}
-static void eglEnd(){if(gd!=EGL_NO_DISPLAY){eglMakeCurrent(gd,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);if(gs!=EGL_NO_SURFACE)eglDestroySurface(gd,gs);if(gc!=EGL_NO_CONTEXT)eglDestroyContext(gd,gc);eglTerminate(gd);}gd=EGL_NO_DISPLAY;}
-static void arrow(ImDrawList*d,ImVec2 a,ImVec2 b,float w,ImU32 c){ImVec2 v(b.x-a.x,b.y-a.y);float l=hypotf(v.x,v.y);if(l<2)return;v.x/=l;v.y/=l;ImVec2 p(-v.y,v.x);float h=std::max(14.f,w*5);d->AddLine(a,b,c,w);d->AddTriangleFilled(b,ImVec2(b.x-v.x*h+p.x*h*.55f,b.y-v.y*h+p.y*h*.55f),ImVec2(b.x-v.x*h-p.x*h*.55f,b.y-v.y*h-p.y*h*.55f),c);}
-static void writeState(const vision::BoardDetect&bd,const std::string&fen,const std::string&bm,const std::string&ev,int depth,int W,int H,bool ok,const std::string&why,bool whiteBottom){std::ofstream f(STATE);f<<"{\n  \"ok\": "<<(ok?"true":"false")<<",\n  \"fen\": \""<<fen<<"\",\n  \"bestmove\": \""<<bm<<"\",\n  \"evaluation\": \""<<ev<<"\",\n  \"depth\": "<<depth<<",\n  \"board_x\": "<<bd.x<<", \"board_y\": "<<bd.y<<", \"board_w\": "<<bd.size<<", \"board_h\": "<<bd.size<<",\n  \"reason\": \""<<why<<"\"\n}\n";}
-static int fileOf(char c){return c-'a';} static int rankOf(char c){return c-'1';}
-static ImVec2 squareCenter(const vision::BoardDetect&bd,const std::string&s,bool wb){int f=fileOf(s[0]),r=rankOf(s[1]);int col=wb?f:7-f;int row=wb?7-r:r;float q=bd.size/8.f;return ImVec2(bd.x+(col+.5f)*q,bd.y+(row+.5f)*q);}
-static std::string jsonEscape(std::string s){for(char&c:s)if(c=='"')c='\'';return s;}
-static bool analyzeUCI(SF& sf,const std::string&fen,int depth,std::string&bm,std::string&ev){
- if(sf.in<0||fen.empty()) return false; sf.send("position fen "+fen); sf.send("go depth "+std::to_string(depth));
- auto t=std::chrono::steady_clock::now(); std::string all; char buf[8192]; bm.clear(); ev.clear();
- while(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-t).count()<20){ssize_t n=read(sf.out,buf,sizeof(buf)-1);if(n>0){buf[n]=0;all.append(buf);std::istringstream is(std::string(buf));std::string line;while(std::getline(is,line)){if(line.rfind("info ",0)==0){auto p=line.find("score cp ");if(p!=std::string::npos){std::istringstream q(line.substr(p+9));int cp; if(q>>cp){char x=cp>=0?'+':'-';int ac=std::abs(cp);ev=std::string(1,x)+std::to_string(ac/100)+"."+std::to_string((ac/10)%10)+std::to_string(ac%10);}}}if(line.rfind("bestmove ",0)==0){std::istringstream q(line);std::string tag;q>>tag>>bm;return !bm.empty();}}}usleep(5000);}return false;
+static EGLDisplay gd=EGL_NO_DISPLAY;
+static EGLSurface gs=EGL_NO_SURFACE;
+static EGLContext gc=EGL_NO_CONTEXT;
+static ANativeWindow* gw=nullptr;
+static const char* STATE="/data/adb/chess_analyzer/run/analysis.json";
+static const char* STOCK="/data/local/tmp/stockfish-android-arm64";
+static const char* LEARN="/data/adb/chess_analyzer/run/templates.bin";
+struct SF {
+	pid_t pid=-1;
+	int in=-1,out=-1;
+	std::string linebuf;
+	bool start() {
+		int a[2],b[2];
+		if(pipe(a)||pipe(b))return false;
+		pid=fork();
+		if(pid==0) {
+			dup2(a[0],0);
+			dup2(b[1],1);
+			dup2(b[1],2);
+			close(a[1]);
+			close(b[0]);
+			execl(STOCK,STOCK,(char*)nullptr);
+			_exit(127);
+		}
+		close(a[0]);
+		close(b[1]);
+		in=a[1];
+		out=b[0];
+		fcntl(out,F_SETFL,O_NONBLOCK);
+		send("uci");
+		return wait("uciok",3000);
+	} bool send(const std::string&s) {
+		if(in<0)return false;
+		std::string x=s+"\n";
+		return write(in,x.data(),x.size())==(ssize_t)x.size();
+	} bool wait(const std::string&needle,int ms,std::string*all=nullptr) {
+		auto t=std::chrono::steady_clock::now();
+		std::string s;
+		char b[4096];
+		while(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()-t).count()<ms) {
+			ssize_t n=read(out,b,sizeof(b));
+			if(n>0) {
+				s.append(b,n);
+				if(s.find(needle)!=std::string::npos) {
+					if(all)*all=s;
+					return true;
+				}
+			}
+			usleep(5000);
+		}
+		if(all)*all=s;
+		return false;
+	} void stop() {
+		if(pid>0) {
+			send("quit");
+			waitpid(pid,nullptr,0);
+		}
+		if(in>=0)close(in);
+		if(out>=0)close(out);
+		pid=-1;
+		in=out=-1;
+	}
+};
+static bool root() {
+	return geteuid()==0;
 }
-int main(){if(!root())return 10;if(!mkdirs())return 11;auto di=android::ANativeWindowCreator::GetDisplayInfo();if(di.width<=0||di.height<=0)return 12;gw=android::ANativeWindowCreator::Create({.name="ChessAnalyzerOverlay",.width=di.width,.height=di.height,.skipScreenshot=true});if(!gw||!eglInit(gw,di.width,di.height))return 13;IMGUI_CHECKVERSION();ImGui::CreateContext();ImGui::StyleColorsDark();ImGui::GetIO().IniFilename=nullptr;ImGui::GetIO().DisplaySize=ImVec2((float)di.width,(float)di.height);ImGui_ImplOpenGL3_Init("#version 300 es");
-SF sf;bool sfok=sf.start();vision::Recognizer rec;rec.load(LEARN);bool analyzer=true,autoA=true,showMove=true,showArrow=true,showHi=true,showEval=true;int depth=12,orientation=-1; int side=0; std::string castling="-", ep="-";float opacity=.75f,thick=10,interval=.8f;std::string fen,bm,ev,status=sfok?"Stockfish ready":"Stockfish unavailable";vision::BoardDetect bd;bool wb=true;auto next=std::chrono::steady_clock::now();std::string lastFen;
-while(true){auto now=std::chrono::steady_clock::now();if(analyzer&&autoA&&now>=next){next=now+std::chrono::milliseconds((int)(interval*1000));vision::Image im;std::string err;if(capture(im,err)){bd=vision::detectBoard(im);if(bd.found){if(!rec.learned()){std::string le;if(rec.learnFromStart(im,bd.x,bd.y,bd.size,le)){rec.save(LEARN);status="Templates learned";}else status="Template learning: "+le;}if(rec.learned()){auto rr=rec.recognize(im,bd.x,bd.y,bd.size);if(rr.ok){int o=orientation<0?vision::autoOrientation(rr.grid,err):(orientation==0?0:1);if(o<0)status="ORIENTATION UNCERTAIN";else{wb=o==1;auto board=vision::gridToBoard(rr.grid,wb);std::string why;if(chess::validate(board,true,false,why)){char stm=side==0?'w':'b';fen=chess::fen(board,stm,castling,ep);if(fen!=lastFen&&sfok&&autoA){std::string nb,ne;if(analyzeUCI(sf,fen,depth,nb,ne)){bm=nb;ev=ne;lastFen=fen;writeState(bd,fen,bm,ev,depth,di.width,di.height,true,"",wb);status="ANALYSIS READY";}else status="STOCKFISH TIMEOUT";}}else status="BOARD INVALID: "+why;}}else status="PIECE RECOGNITION: "+rr.why;}}else status="BOARD NOT RECOGNIZED";}else status="CAPTURE: "+err;}
+static bool mkdirs() {
+	mkdir("/data/adb/chess_analyzer",0755);
+	mkdir("/data/adb/chess_analyzer/run",0755);
+	return access("/data/adb/chess_analyzer/run",W_OK)==0;
 }
-ImGui_ImplOpenGL3_NewFrame();ImGui::NewFrame();ImDrawList*d=ImGui::GetBackgroundDrawList();if(!bm.empty()&&bd.found&&showHi&&bm.size()>=4){ImVec2 a=squareCenter(bd,bm.substr(0,2),wb),z=squareCenter(bd,bm.substr(2,2),wb);float q=bd.size/8.f,h=q*.46f;d->AddRectFilled(ImVec2(a.x-h,a.y-h),ImVec2(a.x+h,a.y+h),IM_COL32(60,170,255,(int)(255*opacity)),5);d->AddRectFilled(ImVec2(z.x-h,z.y-h),ImVec2(z.x+h,z.y+h),IM_COL32(255,205,50,(int)(255*opacity)),5);if(showArrow)arrow(d,a,z,std::max(4.f,q*.08f),IM_COL32(50,230,110,(int)(255*opacity)));}
-ImGui::SetNextWindowPos(ImVec2(20,35),ImGuiCond_Always);ImGui::SetNextWindowSize(ImVec2(430,0),ImGuiCond_Always);ImGui::Begin("CHESS ANALYZER");ImGui::Text("OFFLINE ROOT OVERLAY");ImGui::Separator();ImGui::Text("ANALYZER");ImGui::Checkbox("ON",&analyzer);ImGui::Checkbox("AUTO ANALYZE",&autoA);if(ImGui::Button("SCAN NOW"))next=now;ImGui::Checkbox("SHOW BEST MOVE",&showMove);ImGui::Checkbox("SHOW ARROW",&showArrow);ImGui::Checkbox("SHOW HIGHLIGHTS",&showHi);ImGui::Checkbox("SHOW EVALUATION",&showEval);ImGui::Separator();ImGui::Text("BOARD: %s",bd.found?"FOUND":"NOT FOUND");ImGui::Text("Orientation");ImGui::RadioButton("AUTO",&orientation,-1);ImGui::SameLine();ImGui::RadioButton("WHITE",&orientation,1);ImGui::SameLine();ImGui::RadioButton("BLACK",&orientation,0);ImGui::TextWrapped("%s",status.c_str());ImGui::Text("STOCKFISH");ImGui::SliderInt("Depth",&depth,1,30);ImGui::SliderFloat("Scan interval",&interval,.2f,5.f,"%.1fs");ImGui::SliderFloat("Arrow opacity",&opacity,.1f,1.f,"%.2f");ImGui::SliderFloat("Arrow thickness",&thick,2.f,24.f,"%.1f");ImGui::Text("Side to move"); ImGui::RadioButton("WHITE",&side,0); ImGui::SameLine(); ImGui::RadioButton("BLACK",&side,1); ImGui::Text("Castling: %s",castling.c_str()); ImGui::Text("FEN: %s",fen.empty()?"--":fen.c_str());if(showMove)ImGui::Text("BEST MOVE: %s",bm.empty()?"--":bm.c_str());if(showEval)ImGui::Text("EVAL: %s",ev.empty()?"--":ev.c_str());ImGui::Text("DEPTH: %d",depth);ImGui::End();ImGui::Render();glClearColor(0,0,0,0);glClear(GL_COLOR_BUFFER_BIT);ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());eglSwapBuffers(gd,gs);android::ANativeWindowCreator::ProcessMirrorDisplay();usleep(16000);}
-sf.stop();ImGui_ImplOpenGL3_Shutdown();ImGui::DestroyContext();eglEnd();android::ANativeWindowCreator::Destroy(gw);return 0;}
+static bool capture(vision::Image& im,std::string&err) {
+	FILE*p=popen("/system/bin/screencap","r");
+	if(!p) {
+		err="screencap unavailable";
+		return false;
+	}
+	std::vector<uint8_t>b;
+	uint8_t x[65536];
+	size_t n;
+	while((n=fread(x,1,sizeof(x),p))>0)b.insert(b.end(),x,x+n);
+	int rc=pclose(p);
+	if(rc!=0) {
+		err="screencap failed";
+		return false;
+	}
+	return vision::parseRawScreencap(b,im,err);
+}
+static bool eglInit(ANativeWindow*w,int W,int H) {
+	gd=eglGetDisplay(EGL_DEFAULT_DISPLAY);
+	if(gd==EGL_NO_DISPLAY||!eglInitialize(gd,nullptr,nullptr))return false;
+	const EGLint a[]= {EGL_RENDERABLE_TYPE,EGL_OPENGL_ES3_BIT,EGL_SURFACE_TYPE,EGL_WINDOW_BIT,EGL_RED_SIZE,8,EGL_GREEN_SIZE,8,EGL_BLUE_SIZE,8,EGL_ALPHA_SIZE,8,EGL_NONE};
+	EGLConfig c;
+	EGLint n;
+	if(!eglChooseConfig(gd,a,&c,1,&n)||n!=1)return false;
+	const EGLint ca[]= {EGL_CONTEXT_CLIENT_VERSION,3,EGL_NONE};
+	gc=eglCreateContext(gd,c,EGL_NO_CONTEXT,ca);
+	gs=eglCreateWindowSurface(gd,c,w,nullptr);
+	if(gc==EGL_NO_CONTEXT||gs==EGL_NO_SURFACE||!eglMakeCurrent(gd,gs,gs,gc))return false;
+	glViewport(0,0,W,H);
+	return true;
+}
+static void eglEnd() {
+	if(gd!=EGL_NO_DISPLAY) {
+		eglMakeCurrent(gd,EGL_NO_SURFACE,EGL_NO_SURFACE,EGL_NO_CONTEXT);
+		if(gs!=EGL_NO_SURFACE)eglDestroySurface(gd,gs);
+		if(gc!=EGL_NO_CONTEXT)eglDestroyContext(gd,gc);
+		eglTerminate(gd);
+	}
+	gd=EGL_NO_DISPLAY;
+}
+static void arrow(ImDrawList*d,ImVec2 a,ImVec2 b,float w,ImU32 c) {
+	ImVec2 v(b.x-a.x,b.y-a.y);
+	float l=hypotf(v.x,v.y);
+	if(l<2)return;
+	v.x/=l;
+	v.y/=l;
+	ImVec2 p(-v.y,v.x);
+	float h=std::max(14.f,w*5);
+	d->AddLine(a,b,c,w);
+	d->AddTriangleFilled(b,ImVec2(b.x-v.x*h+p.x*h*.55f,b.y-v.y*h+p.y*h*.55f),ImVec2(b.x-v.x*h-p.x*h*.55f,b.y-v.y*h-p.y*h*.55f),c);
+}
+static void writeState(const vision::BoardDetect&bd,const std::string&fen,const std::string&bm,const std::string&ev,int depth,int W,int H,bool ok,const std::string&why,bool whiteBottom) {
+	std::ofstream f(STATE);
+	f<<"{\n  \"ok\": "<<(ok?"true":"false")<<",\n  \"fen\": \""<<fen<<"\",\n  \"bestmove\": \""<<bm<<"\",\n  \"evaluation\": \""<<ev<<"\",\n  \"depth\": "<<depth<<",\n  \"board_x\": "<<bd.x<<", \"board_y\": "<<bd.y<<", \"board_w\": "<<bd.size<<", \"board_h\": "<<bd.size<<",\n  \"reason\": \""<<why<<"\"\n}\n";
+}
+static int fileOf(char c) {
+	return c-'a';
+}
+static int rankOf(char c) {
+	return c-'1';
+}
+static ImVec2 squareCenter(const vision::BoardDetect&bd,const std::string&s,bool wb) {
+	int f=fileOf(s[0]),r=rankOf(s[1]);
+	int col=wb?f:7-f;
+	int row=wb?7-r:r;
+	float q=bd.size/8.f;
+	return ImVec2(bd.x+(col+.5f)*q,bd.y+(row+.5f)*q);
+}
+static std::string jsonEscape(std::string s) {
+	for(char&c:s)if(c=='"')c='\'';
+	return s;
+}
+static bool analyzeUCI(SF& sf,const std::string&fen,int depth,std::string&bm,std::string&ev) {
+	if(sf.in<0||fen.empty()) return false;
+	sf.send("position fen "+fen);
+	sf.send("go depth "+std::to_string(depth));
+	auto t=std::chrono::steady_clock::now();
+	std::string all;
+	char buf[8192];
+	bm.clear();
+	ev.clear();
+	while(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-t).count()<20) {
+		ssize_t n=read(sf.out,buf,sizeof(buf)-1);
+		if(n>0) {
+			buf[n]=0;
+			all.append(buf);
+			std::istringstream is(std::string(buf));
+			std::string line;
+			while(std::getline(is,line)) {
+				if(line.rfind("info ",0)==0) {
+					auto p=line.find("score cp ");
+					if(p!=std::string::npos) {
+						std::istringstream q(line.substr(p+9));
+						int cp;
+						if(q>>cp) {
+							char x=cp>=0?'+':'-';
+							int ac=std::abs(cp);
+							ev=std::string(1,x)+std::to_string(ac/100)+"."+std::to_string((ac/10)%10)+std::to_string(ac%10);
+						}
+					}
+				}
+				if(line.rfind("bestmove ",0)==0) {
+					std::istringstream q(line);
+					std::string tag;
+					q>>tag>>bm;
+					return !bm.empty();
+				}
+			}
+		}
+		usleep(5000);
+	}
+	return false;
+}
+int main() {
+	if(!root())return 10;
+	if(!mkdirs())return 11;
+	auto di=android::ANativeWindowCreator::GetDisplayInfo();
+	if(di.width<=0||di.height<=0)return 12;
+	gw=android::ANativeWindowCreator::Create({.name="ChessAnalyzerOverlay",.width=di.width,.height=di.height,.skipScreenshot=true});
+	if(!gw||!eglInit(gw,di.width,di.height))return 13;
+	IMGUI_CHECKVERSION();
+	ImGui::CreateContext();
+	ImGui::StyleColorsDark();
+	ImGui::GetIO().IniFilename=nullptr;
+	ImGui::GetIO().DisplaySize=ImVec2((float)di.width,(float)di.height);
+	ImGui_ImplOpenGL3_Init("#version 300 es");
+	SF sf;
+	bool sfok=sf.start();
+	vision::Recognizer rec;
+	rec.load(LEARN);
+	bool analyzer=true,autoA=true,showMove=true,showArrow=true,showHi=true,showEval=true;
+	int depth=12,orientation=-1;
+	int side=0;
+	std::string castling="-", ep="-";
+	float opacity=.75f,thick=10,interval=.8f;
+	std::string fen,bm,ev,status=sfok?"Stockfish ready":"Stockfish unavailable";
+	vision::BoardDetect bd;
+	bool wb=true;
+	auto next=std::chrono::steady_clock::now();
+	std::string lastFen;
+	while(true) {
+		auto now=std::chrono::steady_clock::now();
+		if(analyzer&&autoA&&now>=next) {
+			next=now+std::chrono::milliseconds((int)(interval*1000));
+			vision::Image im;
+			std::string err;
+			if(capture(im,err)) {
+				bd=vision::detectBoard(im);
+				if(bd.found) {
+					if(!rec.learned()) {
+						std::string le;
+						if(rec.learnFromStart(im,bd.x,bd.y,bd.size,le)) {
+							rec.save(LEARN);
+							status="Templates learned";
+						}
+						else status="Template learning: "+le;
+					}
+					if(rec.learned()) {
+						auto rr=rec.recognize(im,bd.x,bd.y,bd.size);
+						if(rr.ok) {
+							int o=orientation<0?vision::autoOrientation(rr.grid,err):(orientation==0?0:1);
+							if(o<0)status="ORIENTATION UNCERTAIN";
+							else {
+								wb=o==1;
+								auto board=vision::gridToBoard(rr.grid,wb);
+								std::string why;
+								if(chess::validate(board,true,false,why)) {
+									char stm=side==0?'w':'b';
+									fen=chess::fen(board,stm,castling,ep);
+									if(fen!=lastFen&&sfok&&autoA) {
+										std::string nb,ne;
+										if(analyzeUCI(sf,fen,depth,nb,ne)) {
+											bm=nb;
+											ev=ne;
+											lastFen=fen;
+											writeState(bd,fen,bm,ev,depth,di.width,di.height,true,"",wb);
+											status="ANALYSIS READY";
+										}
+										else status="STOCKFISH TIMEOUT";
+									}
+								}
+								else status="BOARD INVALID: "+why;
+							}
+						}
+						else status="PIECE RECOGNITION: "+rr.why;
+					}
+				}
+				else status="BOARD NOT RECOGNIZED";
+			}
+			else status="CAPTURE: "+err;
+		}
+		ImGui_ImplOpenGL3_NewFrame();
+		ImGui::NewFrame();
+		ImDrawList*d=ImGui::GetBackgroundDrawList();
+		if(!bm.empty()&&bd.found&&showHi&&bm.size()>=4) {
+			ImVec2 a=squareCenter(bd,bm.substr(0,2),wb),z=squareCenter(bd,bm.substr(2,2),wb);
+			float q=bd.size/8.f,h=q*.46f;
+			d->AddRectFilled(ImVec2(a.x-h,a.y-h),ImVec2(a.x+h,a.y+h),IM_COL32(60,170,255,(int)(255*opacity)),5);
+			d->AddRectFilled(ImVec2(z.x-h,z.y-h),ImVec2(z.x+h,z.y+h),IM_COL32(255,205,50,(int)(255*opacity)),5);
+			if(showArrow)arrow(d,a,z,std::max(4.f,q*.08f),IM_COL32(50,230,110,(int)(255*opacity)));
+		}
+		ImGui::SetNextWindowPos(ImVec2(20,35),ImGuiCond_Always);
+		ImGui::SetNextWindowSize(ImVec2(430,0),ImGuiCond_Always);
+		ImGui::Begin("CHESS ANALYZER");
+		ImGui::Text("OFFLINE ROOT OVERLAY");
+		ImGui::Separator();
+		ImGui::Text("ANALYZER");
+		ImGui::Checkbox("ON",&analyzer);
+		ImGui::Checkbox("AUTO ANALYZE",&autoA);
+		if(ImGui::Button("SCAN NOW"))next=now;
+		ImGui::Checkbox("SHOW BEST MOVE",&showMove);
+		ImGui::Checkbox("SHOW ARROW",&showArrow);
+		ImGui::Checkbox("SHOW HIGHLIGHTS",&showHi);
+		ImGui::Checkbox("SHOW EVALUATION",&showEval);
+		ImGui::Separator();
+		ImGui::Text("BOARD: %s",bd.found?"FOUND":"NOT FOUND");
+		ImGui::Text("Orientation");
+		ImGui::RadioButton("AUTO",&orientation,-1);
+		ImGui::SameLine();
+		ImGui::RadioButton("WHITE",&orientation,1);
+		ImGui::SameLine();
+		ImGui::RadioButton("BLACK",&orientation,0);
+		ImGui::TextWrapped("%s",status.c_str());
+		ImGui::Text("STOCKFISH");
+		ImGui::SliderInt("Depth",&depth,1,30);
+		ImGui::SliderFloat("Scan interval",&interval,.2f,5.f,"%.1fs");
+		ImGui::SliderFloat("Arrow opacity",&opacity,.1f,1.f,"%.2f");
+		ImGui::SliderFloat("Arrow thickness",&thick,2.f,24.f,"%.1f");
+		ImGui::Text("Side to move");
+		ImGui::RadioButton("WHITE",&side,0);
+		ImGui::SameLine();
+		ImGui::RadioButton("BLACK",&side,1);
+		ImGui::Text("Castling: %s",castling.c_str());
+		ImGui::Text("FEN: %s",fen.empty()?"--":fen.c_str());
+		if(showMove)ImGui::Text("BEST MOVE: %s",bm.empty()?"--":bm.c_str());
+		if(showEval)ImGui::Text("EVAL: %s",ev.empty()?"--":ev.c_str());
+		ImGui::Text("DEPTH: %d",depth);
+		ImGui::End();
+		ImGui::Render();
+		glClearColor(0,0,0,0);
+		glClear(GL_COLOR_BUFFER_BIT);
+		ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+		eglSwapBuffers(gd,gs);
+		android::ANativeWindowCreator::ProcessMirrorDisplay();
+		usleep(16000);
+	}
+	sf.stop();
+	ImGui_ImplOpenGL3_Shutdown();
+	ImGui::DestroyContext();
+	eglEnd();
+	android::ANativeWindowCreator::Destroy(gw);
+	return 0;
+}
