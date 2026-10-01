@@ -15,9 +15,9 @@
 #include <thread>
 #include <vector>
 #include <algorithm>
-#include "a_native_window_creator.h"
 #include "imgui.h"
 #include "backends/imgui_impl_opengl3.h"
+#include "a_native_window_creator.h"
 #include "vision.h"
 #include "chess_core.h"
 
