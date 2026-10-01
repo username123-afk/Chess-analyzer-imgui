@@ -40,10 +40,11 @@ jobs:
 
       - name: Build Stockfish ARM64
         run: |
-          git clone --depth 1 https://github.com/official-stockfish/Stockfish.git stockfish
-          cd stockfish/src
-          make -j2 build ARCH=armv8 COMP=ndk
-          cp stockfish /tmp/stockfish-android-arm64
+          git clone --branch sf_17 --depth 1 https://github.com/official-stockfish/Stockfish.git stockfish
+           cd stockfish/src
+           export ANDROID_NDK_ROOT="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+           make -j2 profile-build ARCH=armv8 COMP=ndk
+           cp stockfish /tmp/stockfish-android-arm64
           
       - name: Configure
         run: |
