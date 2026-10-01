@@ -166,43 +166,64 @@ static std::string jsonEscape(std::string s) {
 }
 static bool analyzeUCI(SF& sf,const std::string&fen,int depth,std::string&bm,std::string&ev) {
 	if(sf.in<0||fen.empty()) return false;
+
 	sf.send("position fen "+fen);
 	sf.send("go depth "+std::to_string(depth));
+
 	auto t=std::chrono::steady_clock::now();
 	std::string all;
 	char buf[8192];
+
 	bm.clear();
 	ev.clear();
-	while(std::chrono::duration_cast<std::chrono::seconds>(std::chrono::steady_clock::now()-t).count()<20) {
+
+	while(std::chrono::duration_cast<std::chrono::seconds>(
+		std::chrono::steady_clock::now()-t).count()<20) {
+
 		ssize_t n=read(sf.out,buf,sizeof(buf)-1);
+
 		if(n>0) {
 			buf[n]=0;
 			all.append(buf);
-			std::istringstream is(std::string(buf)};
+
+			std::istringstream is{std::string(buf)};
 			std::string line;
+
 			while(std::getline(is,line)) {
 				if(line.rfind("info ",0)==0) {
 					auto p=line.find("score cp ");
+
 					if(p!=std::string::npos) {
 						std::istringstream q(line.substr(p+9));
 						int cp;
+
 						if(q>>cp) {
 							char x=cp>=0?'+':'-';
 							int ac=std::abs(cp);
-							ev=std::string(1,x)+std::to_string(ac/100)+"."+std::to_string((ac/10)%10)+std::to_string(ac%10);
+
+							ev=std::string(1,x)
+								+std::to_string(ac/100)
+								+"."
+								+std::to_string((ac/10)%10)
+								+std::to_string(ac%10);
 						}
 					}
 				}
+
 				if(line.rfind("bestmove ",0)==0) {
 					std::istringstream q(line);
 					std::string tag;
+
 					q>>tag>>bm;
+
 					return !bm.empty();
 				}
 			}
 		}
+
 		usleep(5000);
 	}
+
 	return false;
 }
 int main() {
