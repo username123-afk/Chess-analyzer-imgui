@@ -31,12 +31,22 @@ jobs:
         run: |
           git clone --depth 1 https://github.com/ocornut/imgui.git third_party/imgui
 
-      - name: Fetch Android native-window creator
+            - name: Fetch Android native-window creator
+               run: |
+                   mkdir -p include
+                   curl -L --fail --retry 3 \
+                   https://raw.githubusercontent.com/mohamad-aljeiawi/android-native-window-symbol-patcher/main/a_native_window_creator.h \
+                  -o include/a_native_window_creator.h
+
+      - name: Provide native-window creator globals
         run: |
-          mkdir -p include
-          curl -L --fail --retry 3 \
-            https://raw.githubusercontent.com/mohamad-aljeiawi/android-native-window-symbol-patcher/main/a_native_window_creator.h \
-            -o include/a_native_window_creator.h
+          cat > src/a_native_window_creator.cpp <<'EOF'
+          #include "a_native_window_creator.h"
+
+          namespace android::anative_window_creator::detail::compat {
+          size_t SystemVersion = 0;
+          }
+          EOF
 
       - name: Build Stockfish ARM64
         run: |
