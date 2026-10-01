@@ -26,11 +26,14 @@ jobs:
 
       - name: Install NDK and CMake
         run: |
-          sdkmanager "platform-tools" "platforms;android-35" "ndk;27.2.12479018" "cmake;3.22.1"
+          sdkmanager "platform-tools"
+          sdkmanager "platforms;android-35"
+          sdkmanager "ndk;27.2.12479018"
+          sdkmanager "cmake;3.22.1"
 
-            - name: Fetch Dear ImGui
-              run: |
-               git clone --depth 1 https://github.com/ocornut/imgui.git third_party/imgui
+      - name: Fetch Dear ImGui
+        run: |
+          git clone --depth 1 https://github.com/ocornut/imgui.git third_party/imgui
 
       - name: Fetch Android native-window creator
         run: |
@@ -79,7 +82,8 @@ jobs:
             -DCMAKE_CXX_EXTENSIONS=ON
 
       - name: Build
-        run: cmake --build build --parallel
+        run: |
+          cmake --build build --parallel
 
       - name: Package
         run: |
