@@ -178,7 +178,7 @@ static bool analyzeUCI(SF& sf,const std::string&fen,int depth,std::string&bm,std
 		if(n>0) {
 			buf[n]=0;
 			all.append(buf);
-			std::istringstream is(std::string(buf))};
+			std::istringstream is(std::string(buf)};
 			std::string line;
 			while(std::getline(is,line)) {
 				if(line.rfind("info ",0)==0) {
