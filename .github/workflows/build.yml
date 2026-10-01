@@ -1,1 +1,72 @@
+name: Build ARM64 overlay
 
+on:
+  workflow_dispatch:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Install Android SDK/NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install NDK and CMake
+        run: |
+          sdkmanager "platform-tools" "platforms;android-35" "ndk;27.2.12479018" "cmake;3.22.1"
+
+      - name: Fetch Dear ImGui
+        run: |
+          git clone --depth 1 https://github.com/ocornut/imgui.git third_party/imgui
+
+      - name: Fetch Android native-window creator
+        run: |
+          mkdir -p include
+          curl -L --fail --retry 3 \
+            https://raw.githubusercontent.com/mohamad-aljeiawi/android-native-window-symbol-patcher/main/a_native_window_creator.h \
+            -o include/a_native_window_creator.h
+
+      - name: Build Stockfish ARM64
+        run: |
+          git clone --depth 1 https://github.com/official-stockfish/Stockfish.git stockfish
+          cd stockfish/src
+          make -j2 build ARCH=armv8 COMP=gcc
+          cp stockfish /tmp/stockfish-android-arm64 || true
+
+      - name: Configure
+        run: |
+          export ANDROID_NDK_HOME="$ANDROID_SDK_ROOT/ndk/27.2.12479018"
+          cmake -S . -B build \
+            -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE="$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake" \
+            -DANDROID_ABI=arm64-v8a \
+            -DANDROID_PLATFORM=android-35 \
+            -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        run: cmake --build build --parallel
+
+      - name: Package
+        run: |
+          mkdir -p artifact
+          cp build/chess-analyzer-overlay artifact/chess-analyzer-overlay
+          if [ -f /tmp/stockfish-android-arm64 ]; then cp /tmp/stockfish-android-arm64 artifact/stockfish-android-arm64; fi
+          chmod 755 artifact/chess-analyzer-overlay
+          cp README.md artifact/README.md
+          tar -czf chess-analyzer-overlay-arm64.tar.gz -C artifact .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: chess-analyzer-overlay-arm64
+          path: chess-analyzer-overlay-arm64.tar.gz
