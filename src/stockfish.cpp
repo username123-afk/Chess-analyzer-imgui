@@ -9,6 +9,7 @@
 #include <sys/stat.h>
 #include <sys/wait.h>
 #include <unistd.h>
+#include <mutex>
 
 namespace sf {
 using Clock = std::chrono::steady_clock;
@@ -18,6 +19,8 @@ static int msLeft(Clock::time_point deadline) {
 static bool startsWith(const std::string& s, const char* p) { return s.rfind(p, 0) == 0; }
 
 bool Engine::start(const std::string& path, std::string& err) {
+    // A dead Stockfish pipe must never terminate the overlay via SIGPIPE.
+    signal(SIGPIPE, SIG_IGN);
     stop();
     if (access(path.c_str(), F_OK) != 0) { err = "binary not found: " + path; return false; }
     if (access(path.c_str(), X_OK) != 0) chmod(path.c_str(), 0755);
@@ -138,7 +141,10 @@ Result Engine::analyze(const std::string& fen, char stm, int depth, int timeoutM
     Result r;
     if (!running()) { r.err = "engine process not running"; return r; }
     drain();
-    if (!send("position fen " + fen) || !send("isready")) { r.err = "write to engine failed"; return r; }
+    if (!send("position fen " + fen) || !send("isready")) {
+        r.err = "write to engine failed";
+        return r;
+    }
     if (!waitFor("readyok", 3000)) { r.err = "no readyok after position (engine hung?)"; r.timeout = true; return r; }
     if (!send("go depth " + std::to_string(depth))) { r.err = "write 'go' failed"; return r; }
 
@@ -147,9 +153,24 @@ Result Engine::analyze(const std::string& fen, char stm, int depth, int timeoutM
     for (;;) {
         int left = msLeft(deadline);
         if (left <= 0) {
-            r.timeout = true; r.err = "no bestmove within " + std::to_string(timeoutMs) + " ms";
-            send("stop");
-            waitFor("bestmove", 1500);   // let it finish so the pipe stays in sync
+            r.timeout = true;
+            r.err = "no bestmove within " + std::to_string(timeoutMs) + " ms";
+
+            // IMPORTANT: never return while Stockfish is still thinking.
+            // Otherwise the next position command is sent into an active
+            // search, which can desynchronise the UCI stream and make the
+            // caller think the engine has died.
+            if (!send("stop")) {
+                r.err += "; failed to send stop";
+                return r;
+            }
+            std::string stopLine;
+            if (!waitFor("bestmove", 3000, &stopLine)) {
+                // The process did not acknowledge stop. Treat it as genuinely
+                // wedged and let the caller restart a clean engine.
+                r.err += "; engine did not acknowledge stop";
+                stop();
+            }
             return r;
         }
         int rc = readLine(line, left);
