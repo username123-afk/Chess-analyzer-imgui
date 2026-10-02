@@ -5,7 +5,6 @@
 #include <cstdio>
 #include <cstring>
 #include <numeric>
-#include <limits>
 
 namespace vision {
 
@@ -270,41 +269,9 @@ SqFeat analyzeSquare(const Image& im, float x0, float y0, float s) {
 
     static thread_local uint8_t fg[N * N], outside[N * N], reg[N * N];
     static thread_local int stack[N * N], comp[N * N], best[N * N];
-
-    // Estimate the natural pixel noise of the square from the same outer ring
-    // used for the background.  A fixed RGB-distance threshold is brittle:
-    // dim themes and anti-aliased black pieces can fall below it, while
-    // highlights can exceed it.  Use an adaptive threshold with a safe floor.
-    std::vector<float> ringDist;
-    ringDist.reserve(N * N / 4);
-    for (int j = 0; j < N; j++) {
-        for (int i = 0; i < N; i++) {
-            int m = std::min(std::min(i, j), std::min(N - 1 - i, N - 1 - j));
-            if (m != 2 && m != 3) continue;
-            int c = j * N + i;
-            float d = std::fabs(col[c][0] - bg[0]) +
-                      std::fabs(col[c][1] - bg[1]) +
-                      std::fabs(col[c][2] - bg[2]);
-            ringDist.push_back(d);
-        }
-    }
-    float ringMed = 0.f, ringMad = 0.f;
-    if (!ringDist.empty()) {
-        auto mid = ringDist.begin() + ringDist.size() / 2;
-        std::nth_element(ringDist.begin(), mid, ringDist.end());
-        ringMed = *mid;
-        std::vector<float> dev;
-        dev.reserve(ringDist.size());
-        for (float d : ringDist) dev.push_back(std::fabs(d - ringMed));
-        auto dm = dev.begin() + dev.size() / 2;
-        std::nth_element(dev.begin(), dm, dev.end());
-        ringMad = *dm;
-    }
-    const float fgThreshold = std::max(55.f, ringMed + std::max(25.f, 6.f * ringMad));
-
     for (int c = 0; c < N * N; c++) {
         float d = std::fabs(col[c][0] - bg[0]) + std::fabs(col[c][1] - bg[1]) + std::fabs(col[c][2] - bg[2]);
-        fg[c] = d > fgThreshold;
+        fg[c] = d > 120.f;
         int cx = c % N, cy = c / N;
         if (std::min(std::min(cx, cy), std::min(N - 1 - cx, N - 1 - cy)) < 2) fg[c] = 0;   // margin: ignore neighbour bleed
     }
@@ -447,111 +414,18 @@ static Candidate bestCandidateFor(const SqFeat& f,
 static Candidate bestCandidateAnyColor(const SqFeat& f,
                                        const std::vector<Sample> samples[12],
                                        float lumThr) {
-    // Score every class, not just a hard white/black branch.  This mirrors
-    // per-tile classifier behavior: the best class wins, but callers can still
-    // reject a low-margin result rather than turning uncertainty into a piece.
-    Candidate best, second;
-    for (int k = 0; k < 12; k++) {
-        const bool white = k < 6;
-        for (const Sample& smp : samples[k]) {
-            const float shape = sampleDist(f, smp);
-            const float score = shape + colorPenalty(f.lum, lumThr, white);
-            Candidate c;
-            c.score = score;
-            c.shape = shape;
-            c.piece = kPieces[k];
-            c.white = white;
-            if (c.score < best.score) {
-                second = best;
-                best = c;
-            } else if (c.score < second.score) {
-                second = c;
-            }
-        }
-    }
-    // Encode an ambiguity by making the result just beyond the acceptance
-    // boundary when the two best classes are nearly tied.  This lets main.cpp
-    // use its existing temporal recovery rather than accepting a random class.
-    if (best.piece != '.' && second.piece != '.') {
-        const float margin = second.score - best.score;
-        if (margin < 0.018f && second.piece != best.piece)
-            best.score += 0.035f;
-    }
-    return best;
-}
-
-static Candidate bestAlternative(const SqFeat& f,
-                                 const std::vector<Sample> samples[12],
-                                 float lumThr, char exclude) {
-    Candidate out;
-    for (int k = 0; k < 12; k++) {
-        if (kPieces[k] == exclude) continue;
-        const bool white = k < 6;
-        for (const Sample& smp : samples[k]) {
-            const float shape = sampleDist(f, smp);
-            const float score = shape + colorPenalty(f.lum, lumThr, white);
-            if (score < out.score) {
-                out.score = score;
-                out.shape = shape;
-                out.piece = kPieces[k];
-                out.white = white;
-            }
-        }
-    }
-    return out;
-}
-
-// If the first pass produces duplicate kings, try the second-best class for
-// those squares.  This is a global consistency repair, not a chess-engine
-// guess: it only changes a square when its original class violates the hard
-// invariant of one king per color and another class is sufficiently plausible.
-static void repairDuplicateKings(char grid[64], const SqFeat feats[64],
-                                 const std::vector<Sample> samples[12],
-                                 float lumThr, float maxDist) {
-    for (int pass = 0; pass < 2; pass++) {
-        int wn = 0, bn = 0;
-        for (int i = 0; i < 64; i++) {
-            if (grid[i] == 'K') wn++;
-            else if (grid[i] == 'k') bn++;
-        }
-        if (wn <= 1 && bn <= 1) return;
-
-        auto tryRepair = [&](char king, int kingCount) {
-            if (kingCount <= 1) return false;
-            int keep = -1;
-            float keepScore = 1e9f;
-            for (int i = 0; i < 64; i++) {
-                if (grid[i] != king) continue;
-                Candidate c = bestCandidateFor(feats[i], samples, lumThr, king == 'K');
-                if (c.score < keepScore) { keepScore = c.score; keep = i; }
-            }
-            if (keep < 0) return false;
-
-            bool changed = false;
-            for (int i = 0; i < 64; i++) {
-                if (i == keep || grid[i] != king) continue;
-                Candidate c = bestCandidateFor(feats[i], samples, lumThr, king == 'K');
-                // Explicitly ask for the best non-king alternative.  This is
-                // important because a generic "best of 12" query would simply
-                // return the same false-positive king again.
-                Candidate alt = bestAlternative(feats[i], samples, lumThr, king);
-                if (alt.piece == '.' || alt.score > maxDist) continue;
-                // Only repair when the alternative is reasonably close to the
-                // original shape match.  We never turn a clearly unreadable
-                // square into a guessed piece merely to satisfy king counts.
-                if (alt.score <= c.score + 0.08f && alt.score <= maxDist) {
-                    grid[i] = alt.piece;
-                    changed = true;
-                }
-            }
-            return changed;
-        };
-
-        bool changed = false;
-        changed |= tryRepair('K', wn);
-        changed |= tryRepair('k', bn);
-        if (!changed) return;
-    }
+    // The shape of white and black versions of the same piece is intentionally
+    // almost identical.  Letting shape decide first therefore creates the exact
+    // failure we saw before: a black king on a bright square can become a second
+    // white king.  Use the learned local-contrast boundary as a strong family
+    // selector when the observation is clear; only use both families in the
+    // genuinely ambiguous band.
+    const float delta = f.lum - lumThr;
+    if (delta >= 8.f) return bestCandidateFor(f, samples, lumThr, true);
+    if (delta <= -8.f) return bestCandidateFor(f, samples, lumThr, false);
+    Candidate w = bestCandidateFor(f, samples, lumThr, true);
+    Candidate b = bestCandidateFor(f, samples, lumThr, false);
+    return w.score <= b.score ? w : b;
 }
 
 // ---------------------------------------------------------------- recognizer
@@ -575,7 +449,7 @@ bool Recognizer::learnFromStart(const Image& im, float bx, float by, float size,
         return t / n;
     };
     float top = rowLum(0, 1), bot = rowLum(6, 7);
-    if (std::fabs(top - bot) < 18.f) { err = "cannot tell white pieces from black pieces"; return false; }
+    if (std::fabs(top - bot) < 25.f) { err = "cannot tell white pieces from black pieces"; return false; }
     bool whiteBottom = bot > top;
     lumThr_ = (top + bot) * 0.5f;
 
@@ -623,9 +497,6 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
             }
 
             Candidate cand = bestCandidateAnyColor(feats[idx], samples_, lumThr_);
-            // Keep uncertain classifications out of the board.  A wrong piece
-            // silently changes FEN; an unknown square can be recovered by the
-            // temporal layer in main.cpp.
             if (cand.piece == '.' || cand.score > maxDist) {
                 rr.unknown++; rr.unknownMask[idx] = true;
                 char t[64]; snprintf(t, sizeof t, " r%dc%d(d=%.2f)", r+1, c+1, cand.score);
@@ -645,10 +516,28 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
         return rr;
     }
 
-    // Global sanity repair after all 64 tiles have a candidate.  In particular,
-    // it prevents a single king-shaped false positive from poisoning an otherwise
-    // perfectly readable board.  No move suggestion or Stockfish output is used.
-    repairDuplicateKings(rr.grid, feats, samples_, lumThr_, maxDist);
+    // Be conservative about global chess invariants.  Never "repair" a second
+    // king into a random piece just to make validation pass.  Mark duplicate-king
+    // squares unknown so the state manager can reconcile them against the last
+    // stable board or a legal move transition.
+    int wk = 0, bk = 0;
+    for (int i = 0; i < 64; ++i) {
+        if (rr.grid[i] == 'K') wk++;
+        else if (rr.grid[i] == 'k') bk++;
+    }
+    if (wk > 1 || bk > 1) {
+        for (int i = 0; i < 64; ++i) {
+            if ((wk > 1 && rr.grid[i] == 'K') || (bk > 1 && rr.grid[i] == 'k')) {
+                rr.grid[i] = '.';
+                rr.unknownMask[i] = true;
+                rr.unknown++;
+            }
+        }
+        rr.pieces = 0;
+        for (int i = 0; i < 64; ++i) if (rr.grid[i] != '.') rr.pieces++;
+        rr.why = "duplicate king classification; waiting for temporal reconciliation";
+        return rr;
+    }
 
     rr.pieces = 0;
     rr.worst = 0;
@@ -660,7 +549,7 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
 bool Recognizer::save(const std::string& path) const {
     FILE* fp = fopen(path.c_str(), "wb");
     if (!fp) return false;
-    uint32_t magic = 0x43415433;  // "CAT3": adaptive local-background contrast
+    uint32_t magic = 0x43415432;  // "CAT2": local-background contrast
     fwrite(&magic, 4, 1, fp);
     fwrite(&lumThr_, 4, 1, fp);
     for (auto& v : samples_) {
@@ -676,7 +565,7 @@ bool Recognizer::load(const std::string& path) {
     FILE* fp = fopen(path.c_str(), "rb");
     if (!fp) return false;
     uint32_t magic = 0;
-    bool ok = fread(&magic, 4, 1, fp) == 1 && magic == 0x43415433 && fread(&lumThr_, 4, 1, fp) == 1;
+    bool ok = fread(&magic, 4, 1, fp) == 1 && magic == 0x43415432 && fread(&lumThr_, 4, 1, fp) == 1;
     for (auto& v : samples_) {
         v.clear();
         uint32_t n = 0;

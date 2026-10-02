@@ -180,12 +180,13 @@ struct ScanOut {
     std::string fen, why; int imgW = 0, imgH = 0;
 };
 struct ScanCtx {
-    vision::Recognizer rec; vision::BoardDetect lastBd; bool haveBd = false;
-    // Auto orientation is decided once from a good full frame and then held.
-    // A later frame may only replace it if the locked orientation makes the
-    // recognised position structurally invalid.
+    vision::Recognizer rec;
+    vision::BoardDetect lastBd;
+    bool haveBd = false;
+    // Once auto-orientation has been established, keep it stable. Re-running
+    // orientation arbitration every frame lets a single recognition mistake
+    // mirror the whole board and poison the state tracker.
     int lockedOrientation = -1;
-    int lastConfiguredOrientation = -2;
     std::string lastLearnLog, lastBoardLog;
 };
 
@@ -204,7 +205,12 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
     if (cx.haveBd) { bd = cx.lastBd; if (!vision::verifyBoard(im, bd)) bd = vision::BoardDetect(); }
     bool tracked = bd.found;
     if (!bd.found) bd = vision::detectBoard(im);
-    if (!bd.found) { cx.haveBd = false; so.why = "BOARD NOT FOUND: " + bd.why; return so; }
+    if (!bd.found) {
+        cx.haveBd = false;
+        cx.lockedOrientation = -1;
+        so.why = "BOARD NOT FOUND: " + bd.why;
+        return so;
+    }
     if (!tracked || std::fabs(bd.size - cx.lastBd.size) > 3 || std::fabs(bd.x - cx.lastBd.x) > 3 || std::fabs(bd.y - cx.lastBd.y) > 3) {
         char t[200];
         snprintf(t, sizeof t, "board detection: FOUND x=%.0f y=%.0f size=%.0f score=%d/%d tol=%d (image %dx%d)%s",
@@ -256,57 +262,27 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
         return so;
     }
 
-    // Reset the AUTO lock when the user changes the orientation setting.
-    if (c.orientation != cx.lastConfiguredOrientation) {
-        if (c.orientation >= 0) cx.lockedOrientation = c.orientation;
-        else cx.lockedOrientation = -1;
-        cx.lastConfiguredOrientation = c.orientation;
-    }
-
-    // 4) orientation + structural validation.
-    // In AUTO mode, lock the first orientation that yields a valid board. Do not
-    // call autoOrientation() again on every frame: its heuristic is intentionally
-    // conservative and can become uncertain after pieces move.
-    int o = c.orientation;
-    if (o < 0) o = cx.lockedOrientation;
-    if (o < 0) {
+    // 4) orientation + validation
+    // Manual orientation always wins. In AUTO mode, lock the first reliable
+    // orientation and keep it until the board detector actually loses the board.
+    int o;
+    if (c.orientation >= 0) {
+        o = c.orientation;
+        cx.lockedOrientation = o;
+    } else if (cx.lockedOrientation >= 0) {
+        o = cx.lockedOrientation;
+    } else {
         std::string w;
         o = vision::autoOrientation(bestRr.grid, w);
-        if (o < 0) {
-            so.why = "ORIENTATION UNCERTAIN: " + w;
-            return so;
-        }
+        if (o < 0) { so.why = "ORIENTATION UNCERTAIN: " + w; return so; }
         cx.lockedOrientation = o;
-        LOG("orientation: locked %s", o == 1 ? "white-bottom" : "black-bottom");
+        LOG("orientation locked: %s", o == 1 ? "white-bottom" : "black-bottom");
     }
-
     so.wb = (o == 1);
     chess::Board board = vision::gridToBoard(bestRr.grid, so.wb);
     std::string why;
-    if (!chess::validate(board, true, false, why)) {
-        // If AUTO orientation is locked and this frame makes that orientation
-        // structurally impossible, try the opposite once. This is a real
-        // orientation re-evaluation, not a per-frame flip.
-        if (c.orientation < 0 && cx.lockedOrientation == o) {
-            int alt = o ^ 1;
-            chess::Board ab = vision::gridToBoard(bestRr.grid, alt == 1);
-            std::string aw;
-            if (chess::validate(ab, true, false, aw)) {
-                cx.lockedOrientation = alt;
-                o = alt;
-                so.wb = (o == 1);
-                board = ab;
-                why.clear();
-                LOG("orientation: re-locked %s after previous orientation became invalid",
-                    o == 1 ? "white-bottom" : "black-bottom");
-            }
-        }
-    }
-    if (!why.empty()) {
-        so.why = "POSITION INVALID (not analysed): " + why;
-        return so;
-    }
-    so.board = board;
+    if (!chess::validate(board, true, false, why)) { so.why = "POSITION INVALID (not analysed): " + why; return so; }
+    so.board = board;   // side to move + full legality check + FEN are done by the worker (needs history)
     so.ok = true;
     return so;
 }
@@ -359,99 +335,57 @@ static void worker() {
 
         ScanOut so = scanOnce(cx, c, learn);
         now = nowMs();
-        // ---- If recognition was partial, recover before deciding side-to-move.
-        // Recovery is only a temporary aid. A fully recognised position is accepted
-        // directly and is never required to match Stockfish's previous recommendation.
-        if (!so.ok && trHave && so.hasPartial && so.unknown <= 6) {
-            chess::Board partial = vision::gridToBoard(so.grid, trWb);
-            bool known[64] = {};
-            for (int r = 0; r < 8; ++r) for (int ccol = 0; ccol < 8; ++ccol) {
-                int file = trWb ? ccol : 7 - ccol;
-                int rank = trWb ? 7 - r : r;
-                known[rank * 8 + file] = !so.unknownMask[r * 8 + ccol];
-            }
-
-            bool same = true;
-            for (int i = 0; i < 64; ++i)
-                if (known[i] && partial.sq[i] != trPrev.sq[i]) { same = false; break; }
-
-            chess::Board recovered;
-            std::string rw;
-            bool recoveredOk = false;
-            if (same) {
-                recovered = trPrev;
-                recoveredOk = true;
-                rw = "unchanged position; ignored transient recognition failure";
-            } else {
-                recoveredOk = chess::recoverOneMove(trPrev, trStm, partial, known, recovered, rw);
-            }
-
-            if (recoveredOk) {
-                so.board = recovered;
-                so.wb = trWb;
-                so.ok = true;
-                LOG("vision recovery: %s (unknown=%d)", rw.c_str(), so.unknown);
-            }
-        }
-
         if (so.ok) {
-            // ---- side to move
-            // Explicit setting always wins. In AUTO mode, when the recognised
-            // board changed, infer the move from the previous accepted position.
-            // This is independent of Stockfish's recommendation and handles
-            // captures because the transition is checked as a legal chess move.
-            char stm = 'w';
+            // ---- state manager: recognition proposes a board; history decides
+            // whether it is a stable current position. This is deliberately
+            // independent of Stockfish's previous suggestion, so any legal move
+            // played by the user is accepted.
+            char stm;
             std::string how;
-
             if (c.sideToMove >= 0) {
                 stm = c.sideToMove ? 'b' : 'w';
                 how = "manual";
             } else if (!trHave) {
-                // A static mid-game position does not encode side-to-move in
-                // its pieces. If no history exists, use the board orientation
-                // convention as the documented fallback; users can set Side
-                // to Move explicitly when opening an arbitrary position.
-                stm = (so.board == chess::startBoard()) ? 'w' : (so.wb ? 'w' : 'b');
-                how = "first position: no move history";
+                // A static screenshot cannot reveal whose turn it is. If exactly
+                // one side is legal, use that; otherwise retain the existing UI
+                // convention (the player at the bottom) and make that assumption
+                // explicit in the log/status.
+                std::string yw, yb;
+                bool vw = chess::validateFull(so.board, 'w', yw);
+                bool vb = chess::validateFull(so.board, 'b', yb);
+                if (vw && !vb) { stm = 'w'; how = "first position: only WHITE is legal"; }
+                else if (vb && !vw) { stm = 'b'; how = "first position: only BLACK is legal"; }
+                else {
+                    stm = so.wb ? 'w' : 'b';
+                    how = "first position: side-to-move assumed from board side; set manually if needed";
+                }
             } else if (so.board == trPrev) {
                 stm = trStm;
                 how = "unchanged";
             } else {
-                char inferred = trStm;
-                std::string iw;
-                bool knownAll[64];
-                for (bool& k : knownAll) k = true;
-                chess::Board exactRecovered;
-                if (chess::recoverOneMove(trPrev, trStm, so.board, knownAll, exactRecovered, iw) &&
-                    exactRecovered == so.board) {
-                    inferred = trStm == 'w' ? 'b' : 'w';
-                    stm = inferred;
-                    how = "exact legal move from previous position";
+                // First try the observed position as an exact legal one-move
+                // transition. This is the key state-manager rule: the move does
+                // not have to equal the engine's previous best move.
+                bool known[64]; for (bool &v : known) v = true;
+                chess::Board recovered; std::string rw;
+                if (chess::recoverOneMove(trPrev, trStm, so.board, known, recovered, rw)) {
+                    so.board = recovered;
+                    stm = trStm == 'w' ? 'b' : 'w';
+                    how = "accepted arbitrary legal move: " + rw;
                 } else {
-                    // We may have missed more than one move between scans. In
-                    // that case a static board can sometimes determine the side
-                    // uniquely from legality; if not, retain the previous side
-                    // rather than rejecting an otherwise valid visible board.
-                    std::string ww, bw;
-                    bool wOk = chess::validateFull(so.board, 'w', ww);
-                    bool bOk = chess::validateFull(so.board, 'b', bw);
-                    if (wOk && !bOk) {
-                        stm = 'w';
-                        how = "inferred: only white-to-move is legal";
-                    } else if (bOk && !wOk) {
-                        stm = 'b';
-                        how = "inferred: only black-to-move is legal";
-                    } else {
-                        stm = trStm;
-                        how = "move history unavailable; retained previous side";
-                    }
+                    // Do not accept a merely plausible FEN. If the observed board
+                    // cannot be proven to be the previous board or one legal move
+                    // away, keep the last stable state and wait for the next frame.
+                    // This is what prevents a single misclassified square from
+                    // turning into "too many pieces" / missing-king cascades.
+                    so.ok = false;
+                    so.why = "POSITION TRANSITION UNCERTAIN: could not match the observed board to one legal move from the last stable position";
                 }
             }
 
             std::string why;
             if (!chess::validateFull(so.board, stm, why)) {
-                char alt = stm == 'w' ? 'b' : 'w';
-                std::string why2;
+                char alt = stm == 'w' ? 'b' : 'w'; std::string why2;
                 if (c.sideToMove < 0 && chess::validateFull(so.board, alt, why2)) {
                     stm = alt;
                     how += "; flipped because the other side was legal";
@@ -460,39 +394,49 @@ static void worker() {
                     so.why = "POSITION INVALID (not analysed): " + why;
                 }
             }
-
             if (so.ok) {
-                // IMPORTANT: build FEN here for both normally recognised and
-                // recovered positions. Previously recovery set so.ok/so.board
-                // but never reached this FEN construction.
                 std::string cast = chess::sanitizeCastling(so.board, c.castling);
                 std::string ep = chess::sanitizeEp(so.board, stm, c.enPassant);
                 so.fen = chess::fen(so.board, stm, cast, ep);
-
-                trHave = true;
-                trPrev = so.board;
-                trStm = stm;
-                trWb = so.wb;
-
-                std::string turn = std::string(stm == 'w' ? "WHITE" : "BLACK") +
-                                   (c.sideToMove < 0 ? " (auto)" : " (manual)");
-                {
-                    std::lock_guard<std::mutex> lk(S.m);
-                    S.turn = turn;
-                }
-                std::string tl = std::string("side to move: ") +
-                                 (stm == 'w' ? "white" : "black") + " [" + how + "]";
-                if (tl != lastTurnLog) {
-                    LOG("%s", tl.c_str());
-                    lastTurnLog = tl;
-                }
+                trHave = true; trPrev = so.board; trStm = stm; trWb = so.wb;
+                std::string turn = std::string(stm == 'w' ? "WHITE" : "BLACK") + (c.sideToMove < 0 ? " (auto)" : " (manual)");
+                { std::lock_guard<std::mutex> lk(S.m); S.turn = turn; }
+                std::string tl = std::string("side to move: ") + (stm == 'w' ? "white" : "black") + " [" + how + "]";
+                if (tl != lastTurnLog) { LOG("%s", tl.c_str()); lastTurnLog = tl; }
             }
         }
-
         {
             std::lock_guard<std::mutex> lk(S.m);
             S.scans++; S.learned = cx.rec.learned();
             if (so.imgW) { S.imgW = so.imgW; S.imgH = so.imgH; }
+        }
+
+        // ---- temporal recovery
+        // If the current frame has a few unreadable squares, do not throw away the game state.
+        // First see whether all recognised squares still agree with the previous position. If not,
+        // ask chess_core to find the unique legal one-move transition that agrees with every
+        // recognised square. This handles highlights/animations on the source/destination squares
+        // and does not assume that the move was the engine's suggestion.
+        if (!so.ok && trHave && so.hasPartial && so.unknown <= 6) {
+            chess::Board partial = vision::gridToBoard(so.grid, trWb);
+            bool known[64] = {};
+            for (int r = 0; r < 8; ++r) for (int ccol = 0; ccol < 8; ++ccol) {
+                int file = trWb ? ccol : 7 - ccol;
+                int rank = trWb ? 7 - r : r;
+                known[rank * 8 + file] = !so.unknownMask[r * 8 + ccol];
+            }
+            bool same = true;
+            for (int i = 0; i < 64; ++i) if (known[i] && partial.sq[i] != trPrev.sq[i]) { same = false; break; }
+            chess::Board recovered; std::string rw;
+            bool recoveredOk = false;
+            if (same) { recovered = trPrev; recoveredOk = true; rw = "unchanged position; ignored transient recognition failure"; }
+            else recoveredOk = chess::recoverOneMove(trPrev, trStm, partial, known, recovered, rw);
+            if (recoveredOk) {
+                so.board = recovered;
+                so.wb = trWb;
+                so.ok = true;
+                LOG("vision recovery: %s (unknown=%d)", rw.c_str(), so.unknown);
+            }
         }
 
         if (!so.ok) {
@@ -502,16 +446,10 @@ static void worker() {
             if (fresh) S.scanStatus = so.why + "  [holding last position]";
             else {
                 S.scanStatus = so.why;
-                if (S.bdValid || !S.bm.empty())
-                    LOG("scan: position unavailable for >%llus: %s",
-                        (unsigned long long)(HOLD_MS / 1000), so.why.c_str());
-                // Keep geometry while the board is still detected/tracked.
-                // If the board itself disappeared, drop the overlay geometry so
-                // the next successful detect becomes the new anchor.
-                if (!so.bdFound) S.bdValid = false;
-                S.bm.clear(); S.ev.clear(); S.pv.clear();
+                if (S.bdValid || !S.bm.empty()) LOG("scan: lost position for >%llus: %s", (unsigned long long)(HOLD_MS / 1000), so.why.c_str());
+                S.bdValid = false; S.bm.clear(); S.ev.clear(); S.pv.clear();
             }
-            if (so.bdFound) { S.bd = so.bd; S.bdValid = true; }
+            if (so.bdFound && fresh) { S.bd = so.bd; }   // keep tracking the board rectangle
             wasGood = false; candCount = 0;
             continue;
         }
