@@ -20,9 +20,13 @@ struct BoardDetect {
     bool found = false;
     float x = 0, y = 0, size = 0;  // board rectangle (square), physical pixels
     int score = 0, maxScore = 0;   // checkerboard agreement
+    int ca[3] = {0,0,0}, cb[3] = {0,0,0};  // the two square colours (for fast re-verification)
+    int tolUsed = 0;
     std::string why;
 };
 BoardDetect detectBoard(const Image& im);
+// Re-check/track a previously found board on a new frame (tolerant, cheap).
+bool verifyBoard(const Image& im, BoardDetect& bd);
 
 constexpr int MG = 40;  // working grid per square
 constexpr int TG = 20;  // template grid
@@ -41,6 +45,7 @@ struct RecogResult {
     bool ok = false;
     char grid[64];        // screen layout: grid[row*8+col], row 0 = top of screen
     int pieces = 0, unknown = 0;
+    std::string unknownSquares;
     float worst = 0;      // worst accepted template distance
     std::string why;
 };

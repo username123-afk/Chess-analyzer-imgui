@@ -45,7 +45,7 @@ static const int kSamples = 6;
 static const float kOff[kSamples][2] = {{.5f,.07f},{.5f,.93f},{.07f,.5f},{.93f,.5f},{.15f,.85f},{.85f,.15f}};
 
 // Checkerboard agreement for a candidate board rectangle (max 64*6).
-static int gridScore(const Image& im, const Col& A, const Col& B, float bx, float by, float S) {
+static int gridScore(const Image& im, const Col& A, const Col& B, float bx, float by, float S, int tol) {
     if (bx < 0 || by < 0 || bx + S > im.w || by + S > im.h) return 0;
     float s = S / 8.f;
     int sx = 0, sy = 0;
@@ -56,7 +56,7 @@ static int gridScore(const Image& im, const Col& A, const Col& B, float bx, floa
                 int px = std::min(im.w - 1, (int)(bx + (c + kOff[k][0]) * s));
                 int py = std::min(im.h - 1, (int)(by + (r + kOff[k][1]) * s));
                 const uint8_t* p = im.at(px, py);
-                bool a = nearCol(p, A, kTol), b = nearCol(p, B, kTol);
+                bool a = nearCol(p, A, tol), b = nearCol(p, B, tol);
                 if (even ? a : b) sx++;
                 if (even ? b : a) sy++;
             }
@@ -78,8 +78,9 @@ static bool longestRun(const std::vector<int>& v, int thr, int gap, int& s, int&
     return bestLen >= 0;
 }
 
-BoardDetect detectBoard(const Image& im) {
+static BoardDetect detectBoardTol(const Image& im, int tol, float thr) {
     BoardDetect bd;
+    bd.tolUsed = tol;
     if (im.w < 200 || im.h < 200) { bd.why = "image too small"; return bd; }
     const int stride = 2;
 
@@ -111,12 +112,14 @@ BoardDetect detectBoard(const Image& im) {
         for (size_t j = i + 1; j < cols.size(); j++) {
             const Col &A = cols[i], &B = cols[j];
             int cd = iabs(A.r - B.r) + iabs(A.g - B.g) + iabs(A.b - B.b);
-            if (cd < 24 || cd > 450) continue;
+            // The two square colours must be further apart than the match tolerance, otherwise two
+            // near-identical dark UI greys 'match' every pixel and any dark area looks like a board.
+            if (cd < std::max(24, 2 * tol + 8) || cd > 450) continue;
             std::vector<int> rowc(H, 0), colc(W, 0);
             for (int y = 0; y < im.h; y += stride)
                 for (int x = 0; x < im.w; x += stride) {
                     const uint8_t* p = im.at(x, y);
-                    if (nearCol(p, A, kTol) || nearCol(p, B, kTol)) rowc[y / stride]++;
+                    if (nearCol(p, A, tol) || nearCol(p, B, tol)) rowc[y / stride]++;
                 }
             int rmax = *std::max_element(rowc.begin(), rowc.end());
             int ys, ye;
@@ -124,7 +127,7 @@ BoardDetect detectBoard(const Image& im) {
             for (int y = ys * stride; y <= std::min(im.h - 1, ye * stride); y += stride)
                 for (int x = 0; x < im.w; x += stride) {
                     const uint8_t* p = im.at(x, y);
-                    if (nearCol(p, A, kTol) || nearCol(p, B, kTol)) colc[x / stride]++;
+                    if (nearCol(p, A, tol) || nearCol(p, B, tol)) colc[x / stride]++;
                 }
             int cmax = *std::max_element(colc.begin(), colc.end());
             int xs, xe;
@@ -133,6 +136,21 @@ BoardDetect detectBoard(const Image& im) {
             float w = x1 - x0, h = y1 - y0;
             if (std::min(w, h) < 0.25f * std::min(im.w, im.h)) continue;
             if (std::max(w, h) / std::min(w, h) > 1.6f) {}  // tolerated: refinement searches sizes
+
+            // The colour-run bounding box is usually the exact board rectangle. The grid score is flat
+            // near the optimum (a few px off scores about the same), so a blind search can settle ~10px
+            // off, which makes pieces bleed into neighbouring squares. Try the exact box first and make
+            // every other candidate beat it by a clear margin.
+            int margin = 0;
+            if (std::max(w, h) / std::min(w, h) < 1.05f) {
+                float S0 = (w + h) * 0.5f;
+                int sc = gridScore(im, A, B, x0, y0, S0, tol);
+                if (sc > bestScore) {
+                    bestScore = sc; bd.x = x0; bd.y = y0; bd.size = S0;
+                    bd.ca[0]=A.r; bd.ca[1]=A.g; bd.ca[2]=A.b; bd.cb[0]=B.r; bd.cb[1]=B.g; bd.cb[2]=B.b;
+                    margin = (int)(0.02f * 64 * kSamples);
+                }
+            }
 
             float sizes[3] = {w, h, (w + h) * 0.5f};
             for (float S0 : sizes)
@@ -144,9 +162,10 @@ BoardDetect detectBoard(const Image& im) {
                             float d = S / 8.f * 0.35f, st = std::max(1.f, S / 120.f);
                             for (float dy = -d; dy <= d; dy += st)
                                 for (float dx = -d; dx <= d; dx += st) {
-                                    int sc = gridScore(im, A, B, ox + dx, oy + dy, S);
-                                    if (sc > bestScore) {
+                                    int sc = gridScore(im, A, B, ox + dx, oy + dy, S, tol);
+                                    if (sc > bestScore + margin) {
                                         bestScore = sc; bd.x = ox + dx; bd.y = oy + dy; bd.size = S;
+                                        bd.ca[0]=A.r; bd.ca[1]=A.g; bd.ca[2]=A.b; bd.cb[0]=B.r; bd.cb[1]=B.g; bd.cb[2]=B.b;
                                     }
                                 }
                         }
@@ -157,16 +176,54 @@ BoardDetect detectBoard(const Image& im) {
                 for (float ds = -bs * 0.01f; ds <= bs * 0.01f; ds += std::max(1.f, bs * 0.005f))
                     for (int dy = -2; dy <= 2; dy++)
                         for (int dx = -2; dx <= 2; dx++) {
-                            int sc = gridScore(im, A, B, bx + dx, by + dy, bs + ds);
-                            if (sc > bestScore) { bestScore = sc; bd.x = bx + dx; bd.y = by + dy; bd.size = bs + ds; }
+                            int sc = gridScore(im, A, B, bx + dx, by + dy, bs + ds, tol);
+                            if (sc > bestScore + margin) { bestScore = sc; bd.x = bx + dx; bd.y = by + dy; bd.size = bs + ds;
+                                bd.ca[0]=A.r; bd.ca[1]=A.g; bd.ca[2]=A.b; bd.cb[0]=B.r; bd.cb[1]=B.g; bd.cb[2]=B.b; }
                         }
             }
         }
     bd.score = bestScore;
     bd.maxScore = 64 * kSamples;
-    if (bestScore >= (int)(0.62f * bd.maxScore) && bd.size >= 0.25f * std::min(im.w, im.h)) bd.found = true;
-    else bd.why = "no 8x8 checkerboard found";
+    if (bestScore >= (int)(thr * bd.maxScore) && bd.size >= 0.25f * std::min(im.w, im.h)) bd.found = true;
+    else bd.why = "no 8x8 checkerboard found (best agreement " + std::to_string(bestScore) + "/" +
+                  std::to_string(bd.maxScore) + ", needed " + std::to_string((int)(thr * bd.maxScore)) +
+                  ", colour tolerance " + std::to_string(tol) + ")";
     return bd;
+}
+
+// Tolerant detection: strict pass first, then progressively looser colour tolerance
+// (handles themes with gradients, brightness changes, dimmed boards, anti-aliased edges).
+BoardDetect detectBoard(const Image& im) {
+    static const int tols[3] = {24, 40, 58};
+    static const float thrs[3] = {0.62f, 0.56f, 0.52f};
+    BoardDetect best;
+    for (int i = 0; i < 3; i++) {
+        BoardDetect bd = detectBoardTol(im, tols[i], thrs[i]);
+        if (bd.found) return bd;
+        if (bd.score >= best.score) best = bd;
+    }
+    return best;
+}
+
+// Cheap re-check of a previously found board: small position/size jitter, loose tolerance.
+bool verifyBoard(const Image& im, BoardDetect& bd) {
+    if (!bd.found || im.w < 200 || im.h < 200) return false;
+    Col A{bd.ca[0], bd.ca[1], bd.ca[2]}, B{bd.cb[0], bd.cb[1], bd.cb[2]};
+    if (iabs(A.r - B.r) + iabs(A.g - B.g) + iabs(A.b - B.b) < 2 * 48 + 8) return false;  // not trackable -> full re-detect
+    int best = gridScore(im, A, B, bd.x, bd.y, bd.size, 48); float bx = bd.x, by = bd.y, bs = bd.size;
+    const int need = best + 3;   // only move for a clear gain, otherwise the rectangle would creep
+    int cur = best;
+    for (int ds = -1; ds <= 1; ds++)
+        for (int dy = -3; dy <= 3; dy++)
+            for (int dx = -3; dx <= 3; dx++) {
+                float S = bd.size * (1.f + 0.01f * ds);
+                int sc = gridScore(im, A, B, bd.x + dx, bd.y + dy, S, 48);
+                if (sc >= need && sc > best) { best = sc; bx = bd.x + dx; by = bd.y + dy; bs = S; }
+            }
+    (void)cur;
+    if (best < (int)(0.55f * bd.maxScore)) return false;
+    bd.x = bx; bd.y = by; bd.size = bs; bd.score = best;
+    return true;
 }
 
 // ---------------------------------------------------------------- per-square analysis
@@ -216,6 +273,8 @@ SqFeat analyzeSquare(const Image& im, float x0, float y0, float s) {
     for (int c = 0; c < N * N; c++) {
         float d = std::fabs(col[c][0] - bg[0]) + std::fabs(col[c][1] - bg[1]) + std::fabs(col[c][2] - bg[2]);
         fg[c] = d > 120.f;
+        int cx = c % N, cy = c / N;
+        if (std::min(std::min(cx, cy), std::min(N - 1 - cx, N - 1 - cy)) < 2) fg[c] = 0;   // margin: ignore neighbour bleed
     }
     // flood from border through non-fg cells -> "outside"; enclosed holes become part of the piece
     memset(outside, 0, sizeof(outside));
@@ -356,7 +415,7 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
         for (int c = 0; c < 8; c++) {
             SqFeat f = analyzeSquare(im, bx + c * s, by + r * s, s);
             if (f.empty) continue;
-            if (f.bad) { rr.unknown++; continue; }
+            if (f.bad) { rr.unknown++; rr.unknownSquares += " r" + std::to_string(r+1) + "c" + std::to_string(c+1) + "(overlay/highlight)"; continue; }
             bool white = f.lum > lumThr_;
             int lo = white ? 0 : 6;
             float best = 1e9f; int bi = -1;
@@ -365,12 +424,12 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
                     float d = sampleDist(f, smp);
                     if (d < best) { best = d; bi = k; }
                 }
-            if (bi < 0 || best > maxDist) { rr.unknown++; continue; }
+            if (bi < 0 || best > maxDist) { rr.unknown++; char t[48]; snprintf(t, sizeof t, " r%dc%d(d=%.2f)", r+1, c+1, best); rr.unknownSquares += t; continue; }
             rr.grid[r * 8 + c] = kPieces[bi];
             rr.pieces++;
             rr.worst = std::max(rr.worst, best);
         }
-    if (rr.unknown) { rr.why = std::to_string(rr.unknown) + " square(s) not recognised"; return rr; }
+    if (rr.unknown) { rr.why = std::to_string(rr.unknown) + " square(s) not recognised (row/col from top-left):" + rr.unknownSquares; return rr; }
     rr.ok = true;
     return rr;
 }
