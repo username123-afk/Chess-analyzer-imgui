@@ -145,7 +145,11 @@ Result Engine::analyze(const std::string& fen, char stm, int depth, int timeoutM
         r.err = "write to engine failed";
         return r;
     }
-    if (!waitFor("readyok", 3000)) { r.err = "no readyok after position (engine hung?)"; r.timeout = true; return r; }
+    if (!waitFor("readyok", 5000)) {
+        r.err = "no readyok after position (engine hung?)";
+        r.timeout = true;
+        return r;
+    }
     if (!send("go depth " + std::to_string(depth))) { r.err = "write 'go' failed"; return r; }
 
     auto deadline = Clock::now() + std::chrono::milliseconds(timeoutMs);
@@ -153,22 +157,37 @@ Result Engine::analyze(const std::string& fen, char stm, int depth, int timeoutM
     for (;;) {
         int left = msLeft(deadline);
         if (left <= 0) {
+            // The watchdog is a safety net, not a reason to throw away a
+            // healthy Stockfish process.  Stop the current search and consume
+            // its mandatory bestmove so the UCI stream remains synchronized.
             r.timeout = true;
-            r.err = "no bestmove within " + std::to_string(timeoutMs) + " ms";
-
-            // IMPORTANT: never return while Stockfish is still thinking.
-            // Otherwise the next position command is sent into an active
-            // search, which can desynchronise the UCI stream and make the
-            // caller think the engine has died.
+            r.err = "search watchdog reached " + std::to_string(timeoutMs) + " ms";
             if (!send("stop")) {
                 r.err += "; failed to send stop";
                 return r;
             }
+
             std::string stopLine;
-            if (!waitFor("bestmove", 3000, &stopLine)) {
-                // The process did not acknowledge stop. Treat it as genuinely
-                // wedged and let the caller restart a clean engine.
+            if (waitFor("bestmove", 10000, &stopLine)) {
+                std::istringstream is(stopLine);
+                std::string tag, mv;
+                is >> tag >> mv;
+                if (mv == "(none)" || mv == "0000") {
+                    r.ok = true;
+                    r.err = "search stopped: no legal moves";
+                    return r;
+                }
+                if (validMove(mv)) {
+                    r.ok = true;
+                    r.bestmove = mv;
+                    r.err = "search stopped by watchdog; returning current bestmove";
+                    LOG("stockfish: watchdog stop returned bestmove %s", mv.c_str());
+                    return r;
+                }
+                r.err += "; malformed stop bestmove '" + stopLine + "'";
+            } else {
                 r.err += "; engine did not acknowledge stop";
+                // Only this path means we could not synchronize the UCI stream.
                 stop();
             }
             return r;

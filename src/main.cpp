@@ -180,13 +180,7 @@ struct ScanOut {
     std::string fen, why; int imgW = 0, imgH = 0;
 };
 struct ScanCtx {
-    vision::Recognizer rec;
-    vision::BoardDetect lastBd;
-    bool haveBd = false;
-    // Once auto-orientation has been established, keep it stable. Re-running
-    // orientation arbitration every frame lets a single recognition mistake
-    // mirror the whole board and poison the state tracker.
-    int lockedOrientation = -1;
+    vision::Recognizer rec; vision::BoardDetect lastBd; bool haveBd = false;
     std::string lastLearnLog, lastBoardLog;
 };
 
@@ -205,12 +199,7 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
     if (cx.haveBd) { bd = cx.lastBd; if (!vision::verifyBoard(im, bd)) bd = vision::BoardDetect(); }
     bool tracked = bd.found;
     if (!bd.found) bd = vision::detectBoard(im);
-    if (!bd.found) {
-        cx.haveBd = false;
-        cx.lockedOrientation = -1;
-        so.why = "BOARD NOT FOUND: " + bd.why;
-        return so;
-    }
+    if (!bd.found) { cx.haveBd = false; so.why = "BOARD NOT FOUND: " + bd.why; return so; }
     if (!tracked || std::fabs(bd.size - cx.lastBd.size) > 3 || std::fabs(bd.x - cx.lastBd.x) > 3 || std::fabs(bd.y - cx.lastBd.y) > 3) {
         char t[200];
         snprintf(t, sizeof t, "board detection: FOUND x=%.0f y=%.0f size=%.0f score=%d/%d tol=%d (image %dx%d)%s",
@@ -263,21 +252,11 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
     }
 
     // 4) orientation + validation
-    // Manual orientation always wins. In AUTO mode, lock the first reliable
-    // orientation and keep it until the board detector actually loses the board.
     int o;
-    if (c.orientation >= 0) {
-        o = c.orientation;
-        cx.lockedOrientation = o;
-    } else if (cx.lockedOrientation >= 0) {
-        o = cx.lockedOrientation;
-    } else {
-        std::string w;
-        o = vision::autoOrientation(bestRr.grid, w);
+    if (c.orientation < 0) {
+        std::string w; o = vision::autoOrientation(bestRr.grid, w);
         if (o < 0) { so.why = "ORIENTATION UNCERTAIN: " + w; return so; }
-        cx.lockedOrientation = o;
-        LOG("orientation locked: %s", o == 1 ? "white-bottom" : "black-bottom");
-    }
+    } else o = c.orientation;
     so.wb = (o == 1);
     chess::Board board = vision::gridToBoard(bestRr.grid, so.wb);
     std::string why;
@@ -336,63 +315,39 @@ static void worker() {
         ScanOut so = scanOnce(cx, c, learn);
         now = nowMs();
         if (so.ok) {
-            // ---- state manager: recognition proposes a board; history decides
-            // whether it is a stable current position. This is deliberately
-            // independent of Stockfish's previous suggestion, so any legal move
-            // played by the user is accepted.
-            char stm;
-            std::string how;
-            if (c.sideToMove >= 0) {
-                stm = c.sideToMove ? 'b' : 'w';
-                how = "manual";
-            } else if (!trHave) {
-                // A static screenshot cannot reveal whose turn it is. If exactly
-                // one side is legal, use that; otherwise retain the existing UI
-                // convention (the player at the bottom) and make that assumption
-                // explicit in the log/status.
-                std::string yw, yb;
-                bool vw = chess::validateFull(so.board, 'w', yw);
-                bool vb = chess::validateFull(so.board, 'b', yb);
-                if (vw && !vb) { stm = 'w'; how = "first position: only WHITE is legal"; }
-                else if (vb && !vw) { stm = 'b'; how = "first position: only BLACK is legal"; }
-                else {
-                    stm = so.wb ? 'w' : 'b';
-                    how = "first position: side-to-move assumed from board side; set manually if needed";
-                }
-            } else if (so.board == trPrev) {
-                stm = trStm;
-                how = "unchanged";
-            } else {
-                // First try the observed position as an exact legal one-move
-                // transition. This is the key state-manager rule: the move does
-                // not have to equal the engine's previous best move.
-                bool known[64]; for (bool &v : known) v = true;
-                chess::Board recovered; std::string rw;
-                if (chess::recoverOneMove(trPrev, trStm, so.board, known, recovered, rw)) {
-                    so.board = recovered;
-                    stm = trStm == 'w' ? 'b' : 'w';
-                    how = "accepted arbitrary legal move: " + rw;
+            // ---- side to move. AUTO: whoever just moved is the side whose pieces appeared on changed squares.
+            char stm; std::string how;
+            if (c.sideToMove >= 0) { stm = c.sideToMove ? 'b' : 'w'; how = "manual"; }
+            else if (!trHave) {
+                // At startup there may be no move history.  For a normal game
+                // position the only reliable visual clue is board orientation:
+                // the player whose pieces are at the bottom is the player to
+                // move when we first see the position after the opponent's move.
+                // Keep the standard initial position as the special case: White
+                // always moves first.
+                if (so.board == chess::startBoard()) {
+                    stm = 'w';
+                    how = "first position: standard start -> white";
                 } else {
-                    // Do not accept a merely plausible FEN. If the observed board
-                    // cannot be proven to be the previous board or one legal move
-                    // away, keep the last stable state and wait for the next frame.
-                    // This is what prevents a single misclassified square from
-                    // turning into "too many pieces" / missing-king cascades.
-                    so.ok = false;
-                    so.why = "POSITION TRANSITION UNCERTAIN: could not match the observed board to one legal move from the last stable position";
+                    stm = so.wb ? 'w' : 'b';
+                    how = so.wb ? "first position: white-bottom -> white"
+                                 : "first position: black-bottom -> black";
                 }
+                LOG("startup side-to-move inference: stm=%c orientation=%s", stm, so.wb ? "white-bottom" : "black-bottom");
+            } else if (so.board == trPrev) { stm = trStm; how = "unchanged"; }
+            else {
+                int wn = 0, bn = 0;
+                for (int i = 0; i < 64; i++)
+                    if (so.board.sq[i] != trPrev.sq[i] && so.board.sq[i] != '.') (chess::isWhite(so.board.sq[i]) ? wn : bn)++;
+                if (wn && !bn) { stm = 'b'; how = "white just moved"; }
+                else if (bn && !wn) { stm = 'w'; how = "black just moved"; }
+                else { stm = trStm; how = "several moves since last scan, kept"; }
             }
-
             std::string why;
             if (!chess::validateFull(so.board, stm, why)) {
                 char alt = stm == 'w' ? 'b' : 'w'; std::string why2;
-                if (c.sideToMove < 0 && chess::validateFull(so.board, alt, why2)) {
-                    stm = alt;
-                    how += "; flipped because the other side was legal";
-                } else {
-                    so.ok = false;
-                    so.why = "POSITION INVALID (not analysed): " + why;
-                }
+                if (c.sideToMove < 0 && chess::validateFull(so.board, alt, why2)) { stm = alt; how += "; flipped because the other side was illegal"; }
+                else { so.ok = false; so.why = "POSITION INVALID (not analysed): " + why; }
             }
             if (so.ok) {
                 std::string cast = chess::sanitizeCastling(so.board, c.castling);
@@ -402,7 +357,7 @@ static void worker() {
                 std::string turn = std::string(stm == 'w' ? "WHITE" : "BLACK") + (c.sideToMove < 0 ? " (auto)" : " (manual)");
                 { std::lock_guard<std::mutex> lk(S.m); S.turn = turn; }
                 std::string tl = std::string("side to move: ") + (stm == 'w' ? "white" : "black") + " [" + how + "]";
-                if (tl != lastTurnLog) { LOG("%s", tl.c_str()); lastTurnLog = tl; }
+                if (turn != lastTurnLog) { LOG("%s", tl.c_str()); lastTurnLog = turn; }
             }
         }
         {
@@ -479,9 +434,15 @@ static void worker() {
             if (!startEngine(c)) { engineRetryAt = nowMs() + 3000; continue; }
         }
         setSf("STOCKFISH: ANALYZING");
-        LOG("analysis start: depth=%d fen=%s", c.depth, so.fen.c_str());
+        const char fenStm = (so.fen.find(" b ") != std::string::npos) ? 'b' : 'w';
+        LOG("analysis start: depth=%d stm=%c fen=%s", c.depth, fenStm, so.fen.c_str());
         uint64_t t0 = nowMs();
-        sf::Result r = eng.analyze(so.fen, so.fen.find(" b ") != std::string::npos ? 'b' : 'w', c.depth, 15000 + c.depth * 1000);
+        // Depth searches on ARM64 can legitimately take longer than the old
+        // 15s + depth watchdog.  The engine itself now stops cleanly and can
+        // return the best move it has found so far, so this is only a hard
+        // safety watchdog rather than the normal search deadline.
+        int sfTimeout = std::max(60000, 30000 + c.depth * 3000);
+        sf::Result r = eng.analyze(so.fen, fenStm, c.depth, sfTimeout);
         uint64_t dt = nowMs() - t0;
         if (r.ok && !r.bestmove.empty()) {
             LOG("bestmove %s eval=%s depth=%d (%llu ms) pv=%s", r.bestmove.c_str(), r.eval.c_str(), r.depth, (unsigned long long)dt, r.pv.c_str());
@@ -494,10 +455,15 @@ static void worker() {
             analyzedFen = so.fen; analyzedDepth = c.depth;
             writeState(so.bd, so.fen, "", "", 0, false, r.err);
         } else {
-            LOG("analysis %s: %s (%llu ms) -> restarting engine", r.timeout ? "TIMEOUT" : "ERROR", r.err.c_str(), (unsigned long long)dt);
-            setSf(r.timeout ? "STOCKFISH: TIMEOUT" : "STOCKFISH: ERROR: " + r.err);
-            eng.stop();
-            engineRetryAt = nowMs() + 2000;
+            LOG("analysis %s: %s (%llu ms)", r.timeout ? "TIMEOUT" : "ERROR", r.err.c_str(), (unsigned long long)dt);
+            setSf(r.timeout ? "STOCKFISH: SEARCH TIMEOUT" : "STOCKFISH: ERROR: " + r.err);
+            // analyze() only returns here without a move when the engine could
+            // not be recovered. Do not tear down a healthy engine just because
+            // the watchdog fired; the next scan can reuse it.
+            if (!eng.running()) {
+                LOG("stockfish: engine is actually down after analysis failure");
+                engineRetryAt = nowMs() + 1000;
+            }
             writeState(so.bd, so.fen, "", "", 0, false, r.err);
         }
     }
