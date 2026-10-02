@@ -15,7 +15,8 @@ void Settings::clamp() {
     arrowOpacity = std::max(0.1f, std::min(1.f, arrowOpacity));
     arrowThickness = std::max(2.f, std::min(24.f, arrowThickness));
     if (orientation != 0 && orientation != 1) orientation = -1;
-    sideToMove = sideToMove ? 1 : 0;
+    // -1 is AUTO; preserve it instead of collapsing it to white/black.
+    if (sideToMove != -1 && sideToMove != 0 && sideToMove != 1) sideToMove = -1;
     if (touchRotation != 0 && touchRotation != 90 && touchRotation != 180 && touchRotation != 270) touchRotation = -1;
     std::string c;
     for (char ch : std::string("KQkq")) if (castling.find(ch) != std::string::npos) c += ch;

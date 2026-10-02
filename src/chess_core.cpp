@@ -112,89 +112,217 @@ std::string fen(const Board& b, char side, const std::string& castling, const st
 namespace chess {
 
 static bool sameKnown(const Board& cand, const Board& partial, const bool known[64]) {
-    for (int i = 0; i < 64; ++i) if (known[i] && cand.sq[i] != partial.sq[i]) return false;
+    for (int i = 0; i < 64; ++i)
+        if (known[i] && cand.sq[i] != partial.sq[i]) return false;
     return true;
 }
 
 static void addCandidate(const Board& b, char stm, const Board& partial, const bool known[64],
                          std::vector<Board>& out) {
     if (!sameKnown(b, partial, known)) return;
+
     std::string why;
     char next = stm == 'w' ? 'b' : 'w';
+    // validateFull() checks that the side that just moved is not left in check
+    // and that the opponent (the new side to move) is not already in an
+    // impossible "not their turn" check state.
     if (!validateFull(b, next, why)) return;
     out.push_back(b);
 }
 
-bool recoverOneMove(const Board& prev, char stm, const Board& partial, const bool known[64], Board& out, std::string& why) {
+static void addPromotionMoves(const Board& prev, char stm, const Board& partial, const bool known[64],
+                              std::vector<Board>& out, int ff, int fr, int tf, int tr) {
+    const bool white = stm == 'w';
+    const char* ps = white ? "QRBN" : "qrbn";
+    for (int i = 0; i < 4; ++i) {
+        Board b = prev;
+        b.at(tf, tr) = ps[i];
+        b.at(ff, fr) = '.';
+        addCandidate(b, stm, partial, known, out);
+    }
+}
+
+bool recoverOneMove(const Board& prev, char stm, const Board& partial, const bool known[64],
+                    Board& out, std::string& why) {
     std::vector<Board> cand;
     const bool white = stm == 'w';
+
+    // The previous position itself must be a structurally/legal position for
+    // this side to move. This also prevents recovery from inventing moves out
+    // of a corrupt previous state.
+    std::string prevWhy;
+    if (!validateFull(prev, stm, prevWhy)) {
+        why = "previous position is invalid: " + prevWhy;
+        return false;
+    }
+
     auto own = [&](char p) { return p != '.' && isWhite(p) == white; };
     auto enemy = [&](char p) { return p != '.' && isWhite(p) != white; };
+
     auto addMove = [&](int ff, int fr, int tf, int tr, char promote = 0) {
-        if (tf < 0 || tf > 7 || tr < 0 || tr > 7 || ff < 0 || ff > 7 || fr < 0 || fr > 7) return;
+        if (tf < 0 || tf > 7 || tr < 0 || tr > 7 ||
+            ff < 0 || ff > 7 || fr < 0 || fr > 7) return;
         char p = prev.at(ff, fr), q = prev.at(tf, tr);
         if (!own(p) || (q != '.' && !enemy(q))) return;
-        Board b = prev; b.at(tf, tr) = promote ? promote : p; b.at(ff, fr) = '.';
+
+        Board b = prev;
+        b.at(tf, tr) = promote ? promote : p;
+        b.at(ff, fr) = '.';
         addCandidate(b, stm, partial, known, cand);
     };
+
     auto slide = [&](int f, int r, int df, int dr) {
         for (int k = 1; k < 8; ++k) {
-            int nf=f+df*k, nr=r+dr*k;
-            if (nf<0||nf>7||nr<0||nr>7) break;
-            char q=prev.at(nf,nr);
-            if (q=='.') addMove(f,r,nf,nr);
-            else { if (enemy(q)) addMove(f,r,nf,nr); break; }
+            int nf = f + df * k, nr = r + dr * k;
+            if (nf < 0 || nf > 7 || nr < 0 || nr > 7) break;
+            char q = prev.at(nf, nr);
+            if (q == '.') {
+                addMove(f, r, nf, nr);
+            } else {
+                if (enemy(q)) addMove(f, r, nf, nr);
+                break;
+            }
         }
     };
-    for (int r=0;r<8;r++) for (int f=0;f<8;f++) {
-        char p=prev.at(f,r); if (!own(p)) continue;
-        switch (p) {
-            case 'P': case 'p': {
-                int d=white?1:-1, start=white?1:6, promo=white?7:0;
-                int nr=r+d;
-                if (nr>=0&&nr<8&&prev.at(f,nr)=='.') {
-                    if (nr==promo) { const char* ps=white?"QRBN":"qrbn"; for(int i=0;i<4;i++) addMove(f,r,f,nr,ps[i]); }
-                    else addMove(f,r,f,nr);
-                    if (r==start && prev.at(f,r+2*d)=='.') addMove(f,r,f,r+2*d);
-                }
-                for(int df: {-1,1}) {
-                    int nf=f+df; if(nf<0||nf>7||nr<0||nr>7) continue;
-                    if (enemy(prev.at(nf,nr))) {
-                        if(nr==promo) { const char* ps=white?"QRBN":"qrbn"; for(int i=0;i<4;i++) addMove(f,r,nf,nr,ps[i]); }
-                        else addMove(f,r,nf,nr);
+
+    for (int r = 0; r < 8; ++r) {
+        for (int f = 0; f < 8; ++f) {
+            char p = prev.at(f, r);
+            if (!own(p)) continue;
+
+            switch (p) {
+                case 'P': case 'p': {
+                    int d = white ? 1 : -1;
+                    int start = white ? 1 : 6;
+                    int promo = white ? 7 : 0;
+                    int nr = r + d;
+
+                    // One-square and initial two-square pawn pushes.
+                    if (nr >= 0 && nr < 8 && prev.at(f, nr) == '.') {
+                        if (nr == promo) addPromotionMoves(prev, stm, partial, known, cand, f, r, f, nr);
+                        else addMove(f, r, f, nr);
+
+                        int nr2 = r + 2 * d;
+                        if (r == start && nr2 >= 0 && nr2 < 8 && prev.at(f, nr2) == '.')
+                            addMove(f, r, f, nr2);
                     }
+
+                    // Normal captures.
+                    for (int df : {-1, 1}) {
+                        int nf = f + df;
+                        if (nf < 0 || nf > 7 || nr < 0 || nr > 7) continue;
+                        if (enemy(prev.at(nf, nr))) {
+                            if (nr == promo) addPromotionMoves(prev, stm, partial, known, cand, f, r, nf, nr);
+                            else addMove(f, r, nf, nr);
+                        }
+                    }
+
+                    // En-passant recovery.
+                    // We do not need the old FEN EP field here: the visual
+                    // transition uniquely shows a diagonal pawn move onto an
+                    // empty square while removing an adjacent enemy pawn.
+                    for (int df : {-1, 1}) {
+                        int nf = f + df;
+                        if (nf < 0 || nf > 7 || nr < 0 || nr > 7) continue;
+                        if (prev.at(nf, nr) != '.') continue;
+                        int capturedRank = r;
+                        char captured = prev.at(nf, capturedRank);
+                        if (captured != (white ? 'p' : 'P')) continue;
+
+                        Board b = prev;
+                        b.at(nf, nr) = p;
+                        b.at(f, r) = '.';
+                        b.at(nf, capturedRank) = '.';
+                        addCandidate(b, stm, partial, known, cand);
+                    }
+                    break;
                 }
-                break;
+
+                case 'N': case 'n': {
+                    static const int k[8][2] = {
+                        {1,2},{2,1},{-1,2},{-2,1},
+                        {1,-2},{2,-1},{-1,-2},{-2,-1}
+                    };
+                    for (auto &d : k) addMove(f, r, f + d[0], r + d[1]);
+                    break;
+                }
+
+                case 'B': case 'b':
+                    slide(f, r, 1, 1); slide(f, r, 1, -1);
+                    slide(f, r, -1, 1); slide(f, r, -1, -1);
+                    break;
+
+                case 'R': case 'r':
+                    slide(f, r, 1, 0); slide(f, r, -1, 0);
+                    slide(f, r, 0, 1); slide(f, r, 0, -1);
+                    break;
+
+                case 'Q': case 'q':
+                    slide(f, r, 1, 1); slide(f, r, 1, -1);
+                    slide(f, r, -1, 1); slide(f, r, -1, -1);
+                    slide(f, r, 1, 0); slide(f, r, -1, 0);
+                    slide(f, r, 0, 1); slide(f, r, 0, -1);
+                    break;
+
+                case 'K': case 'k':
+                    for (int df = -1; df <= 1; ++df)
+                        for (int dr = -1; dr <= 1; ++dr)
+                            if (df || dr) addMove(f, r, f + df, r + dr);
+                    break;
             }
-            case 'N': case 'n': {
-                static const int k[8][2]={{1,2},{2,1},{-1,2},{-2,1},{1,-2},{2,-1},{-1,-2},{-2,-1}};
-                for (auto &d : k) addMove(f, r, f + d[0], r + d[1]);
-                break;
-            }
-            case 'B': case 'b': slide(f,r,1,1); slide(f,r,1,-1); slide(f,r,-1,1); slide(f,r,-1,-1); break;
-            case 'R': case 'r': slide(f,r,1,0); slide(f,r,-1,0); slide(f,r,0,1); slide(f,r,0,-1); break;
-            case 'Q': case 'q':
-                slide(f,r,1,1); slide(f,r,1,-1); slide(f,r,-1,1); slide(f,r,-1,-1);
-                slide(f,r,1,0); slide(f,r,-1,0); slide(f,r,0,1); slide(f,r,0,-1); break;
-            case 'K': case 'k':
-                for(int df=-1;df<=1;df++) for(int dr=-1;dr<=1;dr++) if(df||dr) addMove(f,r,f+df,r+dr);
-                break;
         }
     }
-    // Simple castling recovery when the board itself shows the resulting castle.
-    if (white && prev.at(4,0)=='K') {
-        if (prev.at(7,0)=='R' && prev.at(5,0)=='.' && prev.at(6,0)=='.') { Board b=prev; b.at(6,0)='K'; b.at(5,0)='R'; b.at(4,0)=b.at(7,0)='.'; addCandidate(b,stm,partial,known,cand); }
-        if (prev.at(0,0)=='R' && prev.at(1,0)=='.' && prev.at(2,0)=='.' && prev.at(3,0)=='.') { Board b=prev; b.at(2,0)='K'; b.at(3,0)='R'; b.at(4,0)=b.at(0,0)='.'; addCandidate(b,stm,partial,known,cand); }
-    } else if (!white && prev.at(4,7)=='k') {
-        if (prev.at(7,7)=='r' && prev.at(5,7)=='.' && prev.at(6,7)=='.') { Board b=prev; b.at(6,7)='k'; b.at(5,7)='r'; b.at(4,7)=b.at(7,7)='.'; addCandidate(b,stm,partial,known,cand); }
-        if (prev.at(0,7)=='r' && prev.at(1,7)=='.' && prev.at(2,7)=='.' && prev.at(3,7)=='.') { Board b=prev; b.at(2,7)='k'; b.at(3,7)='r'; b.at(4,7)=b.at(0,7)='.'; addCandidate(b,stm,partial,known,cand); }
+
+    // Castling recovery. Check the starting square and transit square as well
+    // as the resulting position; this avoids accepting castling through check.
+    if (white && prev.at(4,0) == 'K') {
+        if (prev.at(7,0) == 'R' && prev.at(5,0) == '.' && prev.at(6,0) == '.' &&
+            !attacked(prev,4,0,false) && !attacked(prev,5,0,false) && !attacked(prev,6,0,false)) {
+            Board b = prev;
+            b.at(6,0)='K'; b.at(5,0)='R'; b.at(4,0)=b.at(7,0)='.';
+            addCandidate(b, stm, partial, known, cand);
+        }
+        if (prev.at(0,0) == 'R' && prev.at(1,0) == '.' && prev.at(2,0) == '.' && prev.at(3,0) == '.' &&
+            !attacked(prev,4,0,false) && !attacked(prev,3,0,false) && !attacked(prev,2,0,false)) {
+            Board b = prev;
+            b.at(2,0)='K'; b.at(3,0)='R'; b.at(4,0)=b.at(0,0)='.';
+            addCandidate(b, stm, partial, known, cand);
+        }
+    } else if (!white && prev.at(4,7) == 'k') {
+        if (prev.at(7,7) == 'r' && prev.at(5,7) == '.' && prev.at(6,7) == '.' &&
+            !attacked(prev,4,7,true) && !attacked(prev,5,7,true) && !attacked(prev,6,7,true)) {
+            Board b = prev;
+            b.at(6,7)='k'; b.at(5,7)='r'; b.at(4,7)=b.at(7,7)='.';
+            addCandidate(b, stm, partial, known, cand);
+        }
+        if (prev.at(0,7) == 'r' && prev.at(1,7) == '.' && prev.at(2,7) == '.' && prev.at(3,7) == '.' &&
+            !attacked(prev,4,7,true) && !attacked(prev,3,7,true) && !attacked(prev,2,7,true)) {
+            Board b = prev;
+            b.at(2,7)='k'; b.at(3,7)='r'; b.at(4,7)=b.at(0,7)='.';
+            addCandidate(b, stm, partial, known, cand);
+        }
     }
-    if (cand.empty()) { why="no legal one-move transition matches recognised squares"; return false; }
-    // Deduplicate identical boards (promotion variants etc. can collapse under partial visibility).
+
+    if (cand.empty()) {
+        why = "no legal one-move transition matches recognised squares";
+        return false;
+    }
+
     std::vector<Board> uniq;
-    for (auto &b:cand) { bool seen=false; for(auto &u:uniq) if(b==u){seen=true;break;} if(!seen) uniq.push_back(b); }
-    if (uniq.size()!=1) { why="ambiguous recovery: "+std::to_string(uniq.size())+" legal positions match"; return false; }
-    out=uniq[0]; return true;
+    for (const Board& b : cand) {
+        bool seen = false;
+        for (const Board& u : uniq) if (b == u) { seen = true; break; }
+        if (!seen) uniq.push_back(b);
+    }
+
+    if (uniq.size() != 1) {
+        why = "ambiguous recovery: " + std::to_string(uniq.size()) + " legal positions match";
+        return false;
+    }
+
+    out = uniq[0];
+    return true;
 }
+
 
 } // namespace chess
