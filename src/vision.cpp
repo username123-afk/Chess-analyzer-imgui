@@ -323,13 +323,19 @@ SqFeat analyzeSquare(const Image& im, float x0, float y0, float s) {
         minx = std::min(minx, c % N); maxx = std::max(maxx, c % N);
         miny = std::min(miny, c / N); maxy = std::max(maxy, c / N);
     }
-    // median luminance of interior cells (all 4 neighbours inside the piece)
+    // Median luminance of the piece interior, measured relative to the
+    // local square background. Raw screen luminance is unreliable because
+    // the same piece can sit on either a light or dark board square.
     std::vector<float> lums, all;
+    float bgLum = 0.299f * bg[0] + 0.587f * bg[1] + 0.114f * bg[2];
     for (int k = 0; k < bestN; k++) {
         int c = best[k], x = c % N, y = c / N;
         float L = 0.299f * col[c][0] + 0.587f * col[c][1] + 0.114f * col[c][2];
-        all.push_back(L);
-        if (x > 0 && y > 0 && x < N - 1 && y < N - 1 && in[c - 1] && in[c + 1] && in[c - N] && in[c + N]) lums.push_back(L);
+        float contrast = L - bgLum;
+        all.push_back(contrast);
+        if (x > 0 && y > 0 && x < N - 1 && y < N - 1 &&
+            in[c - 1] && in[c + 1] && in[c - N] && in[c + N])
+            lums.push_back(contrast);
     }
     std::vector<float>& L = lums.size() >= 10 ? lums : all;
     std::nth_element(L.begin(), L.begin() + L.size() / 2, L.end());
@@ -438,7 +444,7 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
 bool Recognizer::save(const std::string& path) const {
     FILE* fp = fopen(path.c_str(), "wb");
     if (!fp) return false;
-    uint32_t magic = 0x43415431;  // "CAT1"
+    uint32_t magic = 0x43415432;  // "CAT2": local-background contrast
     fwrite(&magic, 4, 1, fp);
     fwrite(&lumThr_, 4, 1, fp);
     for (auto& v : samples_) {
@@ -454,7 +460,7 @@ bool Recognizer::load(const std::string& path) {
     FILE* fp = fopen(path.c_str(), "rb");
     if (!fp) return false;
     uint32_t magic = 0;
-    bool ok = fread(&magic, 4, 1, fp) == 1 && magic == 0x43415431 && fread(&lumThr_, 4, 1, fp) == 1;
+    bool ok = fread(&magic, 4, 1, fp) == 1 && magic == 0x43415432 && fread(&lumThr_, 4, 1, fp) == 1;
     for (auto& v : samples_) {
         v.clear();
         uint32_t n = 0;
