@@ -171,6 +171,12 @@ static void dumpLearnDebug(const vision::Image& im, const vision::BoardDetect& b
 struct ScanOut {
     bool ok = false; vision::BoardDetect bd; bool bdFound = false; bool wb = true;
     chess::Board board;
+    // Partial recognition is kept so the worker can recover a one-move transition
+    // when a few highlighted/blurred squares cannot be classified.
+    bool hasPartial = false;
+    char grid[64] = {};
+    bool unknownMask[64] = {};
+    int unknown = 0;
     std::string fen, why; int imgW = 0, imgH = 0;
 };
 struct ScanCtx {
@@ -220,10 +226,10 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
 
     // 3) piece recognition, tolerant: small board-rect jitter + looser template distance on retry
     static const float off[5][2] = {{0, 0}, {-2, 0}, {2, 0}, {0, -2}, {0, 2}};
-    static const float dists[2] = {0.25f, 0.32f};
+    static const float dists[3] = {0.25f, 0.38f, 0.50f};
     vision::RecogResult rr, bestRr; bool gotOk = false;
     float savedDist = cx.rec.maxDist;
-    for (int di = 0; di < 2 && !gotOk; di++) {
+    for (int di = 0; di < 3 && !gotOk; di++) {
         cx.rec.maxDist = dists[di];
         for (int oi = 0; oi < 5 && !gotOk; oi++) {
             rr = cx.rec.recognize(im, bd.x + off[oi][0], bd.y + off[oi][1], bd.size);
@@ -232,8 +238,15 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
         }
     }
     cx.rec.maxDist = savedDist;
+    // Keep the partial grid even when recognition is not perfect. The worker can compare it
+    // with the last accepted position and, when possible, reconstruct the one legal move.
+    so.hasPartial = true;
+    memcpy(so.grid, bestRr.grid, 64);
+    memcpy(so.unknownMask, bestRr.unknownMask, 64);
+    so.unknown = bestRr.unknown;
     if (!gotOk) {
-        // do not keep trusting a tracked rectangle that cannot be read: re-detect next scan
+        // IMPORTANT: a recognition failure is not evidence that the board rectangle moved.
+        // Keep the tracked geometry alive and retry it on the next frame.
         so.why = "PIECE RECOGNITION FAILED: " + bestRr.why;
         return so;
     }
@@ -266,7 +279,7 @@ static void worker() {
     int candCount = 0, analyzedDepth = 0;
     bool wasGood = false;
     // side-to-move tracking: remembers the previous accepted position
-    bool trHave = false; chess::Board trPrev; char trStm = 'w'; std::string lastTurnLog;
+    bool trHave = false; chess::Board trPrev; char trStm = 'w'; bool trWb = true; std::string lastTurnLog;
 
     auto setSf = [&](const std::string& s) { std::lock_guard<std::mutex> lk(S.m); S.sfStatus = s; };
     auto startEngine = [&](const Settings& c) -> bool {
@@ -327,7 +340,7 @@ static void worker() {
                 std::string cast = chess::sanitizeCastling(so.board, c.castling);
                 std::string ep = chess::sanitizeEp(so.board, stm, c.enPassant);
                 so.fen = chess::fen(so.board, stm, cast, ep);
-                trHave = true; trPrev = so.board; trStm = stm;
+                trHave = true; trPrev = so.board; trStm = stm; trWb = so.wb;
                 std::string turn = std::string(stm == 'w' ? "WHITE" : "BLACK") + (c.sideToMove < 0 ? " (auto)" : " (manual)");
                 { std::lock_guard<std::mutex> lk(S.m); S.turn = turn; }
                 std::string tl = std::string("side to move: ") + (stm == 'w' ? "white" : "black") + " [" + how + "]";
@@ -338,6 +351,34 @@ static void worker() {
             std::lock_guard<std::mutex> lk(S.m);
             S.scans++; S.learned = cx.rec.learned();
             if (so.imgW) { S.imgW = so.imgW; S.imgH = so.imgH; }
+        }
+
+        // ---- temporal recovery
+        // If the current frame has a few unreadable squares, do not throw away the game state.
+        // First see whether all recognised squares still agree with the previous position. If not,
+        // ask chess_core to find the unique legal one-move transition that agrees with every
+        // recognised square. This handles highlights/animations on the source/destination squares
+        // and does not assume that the move was the engine's suggestion.
+        if (!so.ok && trHave && so.hasPartial && so.unknown <= 6) {
+            chess::Board partial = vision::gridToBoard(so.grid, trWb);
+            bool known[64] = {};
+            for (int r = 0; r < 8; ++r) for (int ccol = 0; ccol < 8; ++ccol) {
+                int file = trWb ? ccol : 7 - ccol;
+                int rank = trWb ? 7 - r : r;
+                known[rank * 8 + file] = !so.unknownMask[r * 8 + ccol];
+            }
+            bool same = true;
+            for (int i = 0; i < 64; ++i) if (known[i] && partial.sq[i] != trPrev.sq[i]) { same = false; break; }
+            chess::Board recovered; std::string rw;
+            bool recoveredOk = false;
+            if (same) { recovered = trPrev; recoveredOk = true; rw = "unchanged position; ignored transient recognition failure"; }
+            else recoveredOk = chess::recoverOneMove(trPrev, trStm, partial, known, recovered, rw);
+            if (recoveredOk) {
+                so.board = recovered;
+                so.wb = trWb;
+                so.ok = true;
+                LOG("vision recovery: %s (unknown=%d)", rw.c_str(), so.unknown);
+            }
         }
 
         if (!so.ok) {

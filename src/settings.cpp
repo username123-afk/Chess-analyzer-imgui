@@ -15,7 +15,7 @@ void Settings::clamp() {
     arrowOpacity = std::max(0.1f, std::min(1.f, arrowOpacity));
     arrowThickness = std::max(2.f, std::min(24.f, arrowThickness));
     if (orientation != 0 && orientation != 1) orientation = -1;
-    if (sideToMove != 0 && sideToMove != 1) sideToMove = -1;
+    sideToMove = sideToMove ? 1 : 0;
     if (touchRotation != 0 && touchRotation != 90 && touchRotation != 180 && touchRotation != 270) touchRotation = -1;
     std::string c;
     for (char ch : std::string("KQkq")) if (castling.find(ch) != std::string::npos) c += ch;
@@ -32,7 +32,7 @@ std::string Settings::toJson() const {
         "  \"analyzer_enabled\": %s,\n  \"auto_analyze\": %s,\n  \"show_best_move\": %s,\n"
         "  \"show_arrow\": %s,\n  \"show_highlights\": %s,\n  \"show_evaluation\": %s,\n"
         "  \"stockfish_depth\": %d,\n  \"scan_interval\": %.2f,\n  \"arrow_opacity\": %.2f,\n"
-        "  \"arrow_thickness\": %.1f,\n  \"board_orientation\": %d,\n  \"side_to_move_mode\": %d,\n"
+        "  \"arrow_thickness\": %.1f,\n  \"board_orientation\": %d,\n  \"side_to_move\": %d,\n"
         "  \"castling\": \"%s\",\n  \"en_passant\": \"%s\",\n  \"touch_rotation\": %d,\n"
         "  \"stockfish_path\": \"%s\"\n}\n",
         b(analyzer), b(autoAnalyze), b(showBestMove), b(showArrow), b(showHighlights), b(showEval),
@@ -70,7 +70,7 @@ bool Settings::fromJson(const std::string& j) {
     gb("analyzer_enabled", analyzer); gb("auto_analyze", autoAnalyze); gb("show_best_move", showBestMove);
     gb("show_arrow", showArrow); gb("show_highlights", showHighlights); gb("show_evaluation", showEval);
     gi("stockfish_depth", depth); gf("scan_interval", scanInterval); gf("arrow_opacity", arrowOpacity);
-    gf("arrow_thickness", arrowThickness); gi("board_orientation", orientation); gi("side_to_move_mode", sideToMove);
+    gf("arrow_thickness", arrowThickness); gi("board_orientation", orientation); gi("side_to_move", sideToMove);
     gs("castling", castling); gs("en_passant", enPassant); gi("touch_rotation", touchRotation);
     gs("stockfish_path", stockfishPath);
     clamp();

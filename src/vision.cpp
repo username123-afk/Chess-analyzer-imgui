@@ -409,13 +409,14 @@ bool Recognizer::learnFromStart(const Image& im, float bx, float by, float size,
 RecogResult Recognizer::recognize(const Image& im, float bx, float by, float size) const {
     RecogResult rr;
     memset(rr.grid, '.', 64);
+    memset(rr.unknownMask, 0, sizeof(rr.unknownMask));
     if (!learned_) { rr.why = "no piece templates learned yet"; return rr; }
     float s = size / 8.f;
     for (int r = 0; r < 8; r++)
         for (int c = 0; c < 8; c++) {
             SqFeat f = analyzeSquare(im, bx + c * s, by + r * s, s);
             if (f.empty) continue;
-            if (f.bad) { rr.unknown++; rr.unknownSquares += " r" + std::to_string(r+1) + "c" + std::to_string(c+1) + "(overlay/highlight)"; continue; }
+            if (f.bad) { rr.unknown++; rr.unknownMask[r * 8 + c] = true; rr.unknownSquares += " r" + std::to_string(r+1) + "c" + std::to_string(c+1) + "(overlay/highlight)"; continue; }
             bool white = f.lum > lumThr_;
             int lo = white ? 0 : 6;
             float best = 1e9f; int bi = -1;
@@ -424,7 +425,7 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
                     float d = sampleDist(f, smp);
                     if (d < best) { best = d; bi = k; }
                 }
-            if (bi < 0 || best > maxDist) { rr.unknown++; char t[48]; snprintf(t, sizeof t, " r%dc%d(d=%.2f)", r+1, c+1, best); rr.unknownSquares += t; continue; }
+            if (bi < 0 || best > maxDist) { rr.unknown++; rr.unknownMask[r * 8 + c] = true; char t[48]; snprintf(t, sizeof t, " r%dc%d(d=%.2f)", r+1, c+1, best); rr.unknownSquares += t; continue; }
             rr.grid[r * 8 + c] = kPieces[bi];
             rr.pieces++;
             rr.worst = std::max(rr.worst, best);
