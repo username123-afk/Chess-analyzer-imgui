@@ -696,7 +696,6 @@ int main() {
     android::ANativeWindowCreator::Destroy(gw);
     gw = nullptr;
     LOG("exit: clean");
-    olog::close();
     (void)touchOk;
     return 0;
 }
