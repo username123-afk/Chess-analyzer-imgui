@@ -233,7 +233,7 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
     }
     cx.rec.maxDist = savedDist;
     if (!gotOk) {
-        cx.haveBd = false;   // do not keep trusting a tracked rectangle that cannot be read: re-detect next scan
+        // do not keep trusting a tracked rectangle that cannot be read: re-detect next scan
         so.why = "PIECE RECOGNITION FAILED: " + bestRr.why;
         return so;
     }
