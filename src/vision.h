@@ -48,6 +48,8 @@ struct RecogResult {
     std::string unknownSquares;
     float worst = 0;      // worst accepted template distance
     std::string why;
+    bool repaired = false;        // one uncertain square was kept from the last stable board
+    std::string repairNote;
 };
 
 class Recognizer {
@@ -59,7 +61,20 @@ public:
     bool save(const std::string& path) const;
     bool load(const std::string& path);
     float maxDist = 0.25f;  // template acceptance threshold
+
+    // Single-square repair (see recognize()). Never touches maxDist; only runs on the loose retry pass.
+    float repairMinDist = 0.30f;  // repair only when maxDist >= this (the 0.32 pass)
+    float repairMaxD = 0.85f;     // best template distance above this = garbage, never repaired
+    int repairMaxDiff = 8;        // reference is stale if more squares than this differ from it
 private:
+    void resetStable() const;
+    void commitStable(const char g[64]) const;
+    mutable char ref_[64] = {};   // last stable grid (screen layout)
+    mutable char pend_[64] = {};  // candidate awaiting a 2nd identical result
+    mutable int pendCount_ = 0;
+    mutable bool haveRef_ = false;
+    mutable int lastRepairSq_ = -1;
+
     std::vector<Sample> samples_[12];  // index into "PNBRQKpnbrqk"
     float lumThr_ = 128;
     bool learned_ = false;

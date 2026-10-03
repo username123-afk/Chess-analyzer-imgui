@@ -1,4 +1,5 @@
 #include "vision.h"
+#include "log.h"
 
 #include <algorithm>
 #include <cmath>
@@ -368,6 +369,7 @@ static float sampleDist(const SqFeat& f, const Sample& s) {
 
 // ---------------------------------------------------------------- recognizer
 bool Recognizer::learnFromStart(const Image& im, float bx, float by, float size, std::string& err) {
+    resetStable();
     float s = size / 8.f;
     SqFeat feats[64];
     for (int r = 0; r < 8; r++)
@@ -409,6 +411,7 @@ bool Recognizer::learnFromStart(const Image& im, float bx, float by, float size,
     if (!rr.ok) { learned_ = false; err = "self-test failed: " + rr.why; return false; }
     chess::Board got = gridToBoard(rr.grid, whiteBottom);
     if (!(got == sb)) { learned_ = false; err = "self-test failed: start position mismatch"; return false; }
+    resetStable();   // the self-test must not seed the repair reference
     return true;
 }
 
@@ -492,14 +495,18 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
     rr.unknown = 0;
     rr.worst = 0;
     rr.unknownSquares.clear();
+    int unkSq = -1;          // the unknown square (meaningful only when rr.unknown == 1)
+    bool anyBad = false;     // overlay/highlight squares are never repaired
     for (int i = 0; i < 64; i++) {
         if (!cand[i].occupied) continue;
         if (cand[i].bad) {
+            anyBad = true; unkSq = i;
             rr.unknown++;
             rr.unknownSquares += " r" + std::to_string(i / 8 + 1) + "c" + std::to_string(i % 8 + 1) + "(overlay/highlight)";
             continue;
         }
         if (rr.grid[i] == '.') {
+            unkSq = i;
             rr.unknown++;
             float best = 1e9f;
             for (int j = 0; j < 6; j++) best = std::min(best, cand[i].d[j]);
@@ -516,10 +523,52 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
         rr.worst = std::max(rr.worst, accepted);
         if (accepted > maxDist) {
             rr.grid[i] = '.';
+            unkSq = i;
             rr.unknown++;
             char t[64];
             snprintf(t, sizeof t, " r%dc%d(d=%.2f)", i / 8 + 1, i % 8 + 1, accepted);
             rr.unknownSquares += t;
+        }
+    }
+
+    // Single-square repair. Only on the loose retry pass, so every frame the normal path can resolve is
+    // resolved exactly as before. The unknown square keeps its piece from the last stable board only if
+    // that piece is still plausibly there: same colour, and the rest of the board is close to the reference.
+    // A square that was EMPTY (move destination) or held an ENEMY piece (capture) in the reference is never
+    // repaired, so a real move or capture is never papered over.
+    if (rr.unknown == 1 && !anyBad && haveRef_ && maxDist >= repairMinDist && unkSq >= 0) {
+        const int u = unkSq;
+        const char rp = ref_[u];
+        float best = 1e9f;
+        for (int j = 0; j < 6; j++) best = std::min(best, cand[u].d[j]);
+        const bool refWhite = rp >= 'A' && rp <= 'Z';
+        bool ok = rp != '.' && refWhite == cand[u].white && best <= repairMaxD;
+        if (ok && (rp == 'K' || rp == 'k'))                       // never create a 2nd king
+            for (int i = 0; i < 64; i++) if (rr.grid[i] == rp) ok = false;
+        int diff = 0;
+        for (int i = 0; i < 64; i++) if (i != u && rr.grid[i] != ref_[i]) diff++;
+        if (diff > repairMaxDiff) ok = false;                     // stale reference (new game / many moves)
+        // Origin guard. Pieces are only moved, never created: if u's piece had left u, it must have turned
+        // up on another square, so the number of that colour's pieces OUTSIDE u would have grown relative
+        // to the reference (a capture or promotion on the way grows it too). A genuine glitch leaves it
+        // unchanged (another piece of that colour moving or being captured elsewhere nets to <= 0).
+        auto colourCount = [&](const char* g) {
+            int n = 0;
+            for (int i = 0; i < 64; i++)
+                if (i != u && g[i] != '.' && ((g[i] >= 'A' && g[i] <= 'Z') == refWhite)) n++;
+            return n;
+        };
+        if (ok && colourCount(rr.grid) > colourCount(ref_)) ok = false;
+        if (ok) {
+            rr.grid[u] = rp;
+            rr.unknown = 0; rr.pieces++;
+            rr.worst = std::max(rr.worst, best);
+            rr.repaired = true;
+            char t[96];
+            snprintf(t, sizeof t, "r%dc%d kept '%c' from last stable board (d=%.2f, %d other squares differ)",
+                     u / 8 + 1, u % 8 + 1, rp, best, diff);
+            rr.repairNote = t;
+            if (lastRepairSq_ != u) { LOG("recognition: repair: %s", t); lastRepairSq_ = u; }
         }
     }
 
@@ -529,7 +578,18 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
         return rr;
     }
     rr.ok = true;
+    if (!rr.repaired) lastRepairSq_ = -1;
+    commitStable(rr.grid);
     return rr;
+}
+
+// A grid becomes the repair reference only after the same grid is returned twice in a row
+// (mirrors the 2-scan debounce in the worker), so a mid-animation misread is never trusted.
+void Recognizer::resetStable() const { haveRef_ = false; pendCount_ = 0; lastRepairSq_ = -1; }
+void Recognizer::commitStable(const char g[64]) const {
+    if (pendCount_ > 0 && memcmp(g, pend_, 64) == 0) pendCount_++;
+    else { memcpy(pend_, g, 64); pendCount_ = 1; }
+    if (pendCount_ >= 2) { memcpy(ref_, g, 64); haveRef_ = true; }
 }
 
 bool Recognizer::save(const std::string& path) const {
@@ -564,6 +624,7 @@ bool Recognizer::load(const std::string& path) {
     }
     fclose(fp);
     learned_ = ok;
+    resetStable();
     return ok;
 }
 
