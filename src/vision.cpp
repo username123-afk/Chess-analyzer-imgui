@@ -40,6 +40,7 @@ struct Col { int r, g, b; };
 static inline bool nearCol(const uint8_t* p, const Col& c, int tol) {
     return iabs(p[0] - c.r) + iabs(p[1] - c.g) + iabs(p[2] - c.b) < tol;
 }
+static const int kTol = 24;
 static const int kSamples = 6;
 static const float kOff[kSamples][2] = {{.5f,.07f},{.5f,.93f},{.07f,.5f},{.93f,.5f},{.15f,.85f},{.85f,.15f}};
 
@@ -365,69 +366,6 @@ static float sampleDist(const SqFeat& f, const Sample& s) {
     return d + 0.5f * std::fabs(f.aspect - s.aspect) + 1.0f * std::fabs(f.hfrac - s.hfrac);
 }
 
-// A second, intentionally softer score.  The existing mask/aspect/hfrac score
-// is very good at distinguishing piece silhouettes, but some themes make K/Q,
-// K/R, or B/Q look deceptively similar.  We therefore keep the geometric score
-// primary and use local contrast only as a color-consistency term.
-static float colorPenalty(float lum, float threshold, bool white) {
-    // Distance from the learned white/black boundary.  The penalty is 0 when
-    // the observed contrast is on the expected side and grows smoothly when it
-    // crosses the boundary.  This is deliberately bounded so shape still wins.
-    const float wrong = white ? (threshold - lum) : (lum - threshold);
-    if (wrong <= 0.f) return 0.f;
-    return std::min(0.16f, 0.16f * wrong / 45.f);
-}
-
-struct Candidate {
-    char piece = '.';
-    float score = 1e9f;
-    float shape = 1e9f;
-    bool white = false;
-};
-
-static Candidate bestCandidateFor(const SqFeat& f,
-                                  const std::vector<Sample> samples[12],
-                                  float lumThr,
-                                  bool white) {
-    Candidate out;
-    out.white = white;
-    const int lo = white ? 0 : 6;
-    const int hi = lo + 6;
-    for (int k = lo; k < hi; k++) {
-        for (const Sample& smp : samples[k]) {
-            const float shape = sampleDist(f, smp);
-            const float score = shape + colorPenalty(f.lum, lumThr, white);
-            if (score < out.score) {
-                out.score = score;
-                out.shape = shape;
-                out.piece = kPieces[k];
-            }
-        }
-    }
-    return out;
-}
-
-// Return the best candidate among all 12 classes.  Unlike the old recognizer,
-// color is NOT a hard gate.  A hard white/black gate can turn a slightly wrong
-// luminance estimate into a completely wrong piece class.  We instead score
-// both color families and let geometry + local contrast decide.
-static Candidate bestCandidateAnyColor(const SqFeat& f,
-                                       const std::vector<Sample> samples[12],
-                                       float lumThr) {
-    // The shape of white and black versions of the same piece is intentionally
-    // almost identical.  Letting shape decide first therefore creates the exact
-    // failure we saw before: a black king on a bright square can become a second
-    // white king.  Use the learned local-contrast boundary as a strong family
-    // selector when the observation is clear; only use both families in the
-    // genuinely ambiguous band.
-    const float delta = f.lum - lumThr;
-    if (delta >= 8.f) return bestCandidateFor(f, samples, lumThr, true);
-    if (delta <= -8.f) return bestCandidateFor(f, samples, lumThr, false);
-    Candidate w = bestCandidateFor(f, samples, lumThr, true);
-    Candidate b = bestCandidateFor(f, samples, lumThr, false);
-    return w.score <= b.score ? w : b;
-}
-
 // ---------------------------------------------------------------- recognizer
 bool Recognizer::learnFromStart(const Image& im, float bx, float by, float size, std::string& err) {
     float s = size / 8.f;
@@ -449,7 +387,7 @@ bool Recognizer::learnFromStart(const Image& im, float bx, float by, float size,
         return t / n;
     };
     float top = rowLum(0, 1), bot = rowLum(6, 7);
-    if (std::fabs(top - bot) < 25.f) { err = "cannot tell white pieces from black pieces"; return false; }
+    if (std::fabs(top - bot) < 40.f) { err = "cannot tell white pieces from black pieces"; return false; }
     bool whiteBottom = bot > top;
     lumThr_ = (top + bot) * 0.5f;
 
@@ -466,6 +404,7 @@ bool Recognizer::learnFromStart(const Image& im, float bx, float by, float size,
             samples_[pi].push_back(smp);
         }
     learned_ = true;
+    // self-test: the learned templates must reproduce the start position
     RecogResult rr = recognize(im, bx, by, size);
     if (!rr.ok) { learned_ = false; err = "self-test failed: " + rr.why; return false; }
     chess::Board got = gridToBoard(rr.grid, whiteBottom);
@@ -476,72 +415,119 @@ bool Recognizer::learnFromStart(const Image& im, float bx, float by, float size,
 RecogResult Recognizer::recognize(const Image& im, float bx, float by, float size) const {
     RecogResult rr;
     memset(rr.grid, '.', 64);
-    memset(rr.unknownMask, 0, sizeof(rr.unknownMask));
     if (!learned_) { rr.why = "no piece templates learned yet"; return rr; }
-    float s = size / 8.f;
-    SqFeat feats[64];
 
-    // First pass: independently classify every occupied tile.  Empty squares
-    // are decided only from the local foreground segmentation.  This mirrors
-    // the robust "one tile -> one class + confidence" architecture used by
-    // modern screenshot recognizers, without introducing an ML runtime.
+    struct Cand {
+        bool occupied = false;
+        bool bad = false;
+        bool white = true;
+        float d[6];
+        int best = -1;
+    } cand[64];
+
+    float s = size / 8.f;
     for (int r = 0; r < 8; r++)
         for (int c = 0; c < 8; c++) {
-            const int idx = r * 8 + c;
-            feats[idx] = analyzeSquare(im, bx + c * s, by + r * s, s);
-            if (feats[idx].empty) continue;
-            if (feats[idx].bad) {
-                rr.unknown++; rr.unknownMask[idx] = true;
-                rr.unknownSquares += " r" + std::to_string(r+1) + "c" + std::to_string(c+1) + "(overlay/highlight)";
-                continue;
-            }
+            int si = r * 8 + c;
+            SqFeat f = analyzeSquare(im, bx + c * s, by + r * s, s);
+            if (f.empty) continue;
+            cand[si].occupied = true;
+            if (f.bad) { cand[si].bad = true; continue; }
 
-            Candidate cand = bestCandidateAnyColor(feats[idx], samples_, lumThr_);
-            if (cand.piece == '.' || cand.score > maxDist) {
-                rr.unknown++; rr.unknownMask[idx] = true;
-                char t[64]; snprintf(t, sizeof t, " r%dc%d(d=%.2f)", r+1, c+1, cand.score);
-                rr.unknownSquares += t;
-                continue;
+            bool white = f.lum > lumThr_;
+            cand[si].white = white;
+            int lo = white ? 0 : 6;
+            float best = 1e9f;
+            int bi = -1;
+            for (int j = 0; j < 6; j++) {
+                int k = lo + j;
+                float bd = 1e9f;
+                for (const Sample& smp : samples_[k]) bd = std::min(bd, sampleDist(f, smp));
+                cand[si].d[j] = bd;
+                if (bd < best) { best = bd; bi = j; }
             }
-            rr.grid[idx] = cand.piece;
-            rr.pieces++;
-            rr.worst = std::max(rr.worst, cand.score);
+            cand[si].best = bi;
         }
 
-    // Do not perform global repairs across unknown tiles.  An invented piece
-    // is worse than a recoverable unknown square; main.cpp already has temporal
-    // recovery for a small number of unknowns.
-    if (rr.unknown) {
-        rr.why = std::to_string(rr.unknown) + " square(s) not recognised (row/col from top-left):" + rr.unknownSquares;
-        return rr;
+    // First pass: normal nearest-template classification.
+    for (int i = 0; i < 64; i++) {
+        if (!cand[i].occupied || cand[i].bad) continue;
+        int j = cand[i].best;
+        if (j < 0 || cand[i].d[j] > maxDist) continue;
+        int lo = cand[i].white ? 0 : 6;
+        rr.grid[i] = kPieces[lo + j];
     }
 
-    // Be conservative about global chess invariants.  Never "repair" a second
-    // king into a random piece just to make validation pass.  Mark duplicate-king
-    // squares unknown so the state manager can reconcile them against the last
-    // stable board or a legal move transition.
-    int wk = 0, bk = 0;
-    for (int i = 0; i < 64; ++i) {
-        if (rr.grid[i] == 'K') wk++;
-        else if (rr.grid[i] == 'k') bk++;
-    }
-    if (wk > 1 || bk > 1) {
-        for (int i = 0; i < 64; ++i) {
-            if ((wk > 1 && rr.grid[i] == 'K') || (bk > 1 && rr.grid[i] == 'k')) {
-                rr.grid[i] = '.';
-                rr.unknownMask[i] = true;
-                rr.unknown++;
+    // A legal chess position can contain exactly one king of each colour.
+    // Shape-only nearest-neighbour matching can occasionally call a second
+    // piece a king.  Resolve duplicate kings locally instead of accepting an
+    // impossible board and throwing the entire frame away.
+    for (int color = 0; color < 2; color++) {
+        const int lo = color ? 6 : 0;
+        std::vector<int> kings;
+        std::vector<int> occupied;
+        for (int i = 0; i < 64; i++) {
+            if (!cand[i].occupied || cand[i].bad || cand[i].white != (color == 0)) continue;
+            occupied.push_back(i);
+            if (rr.grid[i] == kPieces[lo + 5]) kings.push_back(i);
+        }
+
+        if (kings.size() > 1) {
+            int keep = kings[0];
+            for (int i : kings) if (cand[i].d[5] < cand[keep].d[5]) keep = i;
+            for (int i : kings) {
+                if (i == keep) continue;
+                float best = 1e9f;
+                int bj = -1;
+                for (int j = 0; j < 5; j++) {
+                    if (cand[i].d[j] < best) { best = cand[i].d[j]; bj = j; }
+                }
+                if (bj >= 0 && best <= maxDist) rr.grid[i] = kPieces[lo + bj];
+                else rr.grid[i] = '.';
             }
         }
-        rr.pieces = 0;
-        for (int i = 0; i < 64; ++i) if (rr.grid[i] != '.') rr.pieces++;
-        rr.why = "duplicate king classification; waiting for temporal reconciliation";
-        return rr;
     }
 
     rr.pieces = 0;
+    rr.unknown = 0;
     rr.worst = 0;
-    for (int i = 0; i < 64; i++) if (rr.grid[i] != '.') rr.pieces++;
+    rr.unknownSquares.clear();
+    for (int i = 0; i < 64; i++) {
+        if (!cand[i].occupied) continue;
+        if (cand[i].bad) {
+            rr.unknown++;
+            rr.unknownSquares += " r" + std::to_string(i / 8 + 1) + "c" + std::to_string(i % 8 + 1) + "(overlay/highlight)";
+            continue;
+        }
+        if (rr.grid[i] == '.') {
+            rr.unknown++;
+            float best = 1e9f;
+            for (int j = 0; j < 6; j++) best = std::min(best, cand[i].d[j]);
+            char t[64];
+            snprintf(t, sizeof t, " r%dc%d(d=%.2f)", i / 8 + 1, i % 8 + 1, best);
+            rr.unknownSquares += t;
+            continue;
+        }
+        int lo = cand[i].white ? 0 : 6;
+        int pi = pieceIndex(rr.grid[i]);
+        int pj = pi >= lo && pi < lo + 6 ? pi - lo : cand[i].best;
+        float accepted = pj >= 0 ? cand[i].d[pj] : 1e9f;
+        rr.pieces++;
+        rr.worst = std::max(rr.worst, accepted);
+        if (accepted > maxDist) {
+            rr.grid[i] = '.';
+            rr.unknown++;
+            char t[64];
+            snprintf(t, sizeof t, " r%dc%d(d=%.2f)", i / 8 + 1, i % 8 + 1, accepted);
+            rr.unknownSquares += t;
+        }
+    }
+
+    if (rr.unknown) {
+        rr.why = std::to_string(rr.unknown) + " square(s) not recognised (row/col from top-left):" + rr.unknownSquares;
+        rr.ok = false;
+        return rr;
+    }
     rr.ok = true;
     return rr;
 }
