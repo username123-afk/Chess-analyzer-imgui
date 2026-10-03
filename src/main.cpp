@@ -18,6 +18,8 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <cctype>
+#include <sstream>
 #include "imgui.h"
 #include "backends/imgui_impl_opengl3.h"
 #include "a_native_window_creator.h"
@@ -267,6 +269,94 @@ static ScanOut scanOnce(ScanCtx& cx, const Settings& c, bool forceLearn) {
 }
 
 // ------------------------------------------------------------------ worker thread
+// The worker keeps an explicit committed/stable position separate from the
+// current vision observation. A single accepted frame is never published
+// directly to the UI or Stockfish.
+struct StableState {
+    bool have = false;
+    chess::Board board;
+    char stm = 'w';
+    bool wb = true;
+    vision::BoardDetect bd;
+    int imgW = 0, imgH = 0;
+    std::string fen;
+    std::string turn = "--";
+};
+
+struct PendingState {
+    bool have = false;
+    std::string fen;
+    chess::Board board;
+    char stm = 'w';
+    bool wb = true;
+    vision::BoardDetect bd;
+    int imgW = 0, imgH = 0;
+    std::string turn = "--";
+    int count = 0;
+};
+
+// Engine-boundary syntax guard. The board legality itself is checked with
+// chess::validateFull() before this is reached.
+static bool engineFenLooksUsable(const std::string& fen, std::string& why) {
+    if (fen.empty()) { why = "empty FEN"; return false; }
+    bool nonempty = false;
+    for (char c : fen) {
+        if (!std::isspace((unsigned char)c)) { nonempty = true; break; }
+    }
+    if (!nonempty) { why = "blank FEN"; return false; }
+    std::istringstream in(fen);
+    std::string board, stm, castling, ep, halfmove, fullmove, extra;
+    if (!(in >> board >> stm >> castling >> ep >> halfmove >> fullmove) || (in >> extra)) {
+        why = "FEN must contain exactly 6 fields";
+        return false;
+    }
+
+    int ranks = 0, files = 0;
+    for (char c : board) {
+        if (c == '/') {
+            if (files != 8) { why = "FEN board rank does not contain 8 files"; return false; }
+            ++ranks; files = 0;
+            continue;
+        }
+        if (c >= '1' && c <= '8') files += c - '0';
+        else if (c == 'P' || c == 'N' || c == 'B' || c == 'R' || c == 'Q' || c == 'K' ||
+                 c == 'p' || c == 'n' || c == 'b' || c == 'r' || c == 'q' || c == 'k') files++;
+        else { why = "FEN board contains an invalid piece/rank character"; return false; }
+        if (files > 8) { why = "FEN board rank exceeds 8 files"; return false; }
+    }
+    if (files != 8 || ranks != 7) { why = "FEN board must contain 8 ranks"; return false; }
+
+    if (stm != "w" && stm != "b") { why = "FEN side-to-move is invalid"; return false; }
+
+    if (castling != "-") {
+        bool seen[4] = {};
+        for (char c : castling) {
+            int idx = c == 'K' ? 0 : c == 'Q' ? 1 : c == 'k' ? 2 : c == 'q' ? 3 : -1;
+            if (idx < 0) { why = "FEN castling field is invalid"; return false; }
+            if (seen[idx]) { why = "FEN castling field contains duplicates"; return false; }
+            seen[idx] = true;
+        }
+    }
+
+    if (ep != "-") {
+        if (ep.size() != 2 || ep[0] < 'a' || ep[0] > 'h' || (ep[1] != '3' && ep[1] != '6')) {
+            why = "FEN en-passant field is invalid";
+            return false;
+        }
+    }
+
+    auto digitsOnly = [](const std::string& s) {
+        if (s.empty()) return false;
+        for (char c : s) if (c < '0' || c > '9') return false;
+        return true;
+    };
+    if (!digitsOnly(halfmove) || !digitsOnly(fullmove)) {
+        why = "FEN move counters are invalid";
+        return false;
+    }
+    return true;
+}
+
 static void worker() {
     sf::Engine eng;
     ScanCtx cx;
@@ -275,11 +365,16 @@ static void worker() {
     { std::lock_guard<std::mutex> lk(S.m); S.learned = cx.rec.learned(); }
 
     uint64_t nextScan = 0, engineRetryAt = 0;
-    std::string candFen, analyzedFen, lastFail, lastFenLog;
-    int candCount = 0, analyzedDepth = 0;
-    bool wasGood = false;
-    // side-to-move tracking: remembers the previous accepted position
-    bool trHave = false; chess::Board trPrev; char trStm = 'w'; bool trWb = true; std::string lastTurnLog;
+    std::string analyzedFen, lastFail, lastFenLog;
+    std::string lastAttemptedFen;
+    int analyzedDepth = 0, lastAttemptedDepth = 0;
+    // trPrev/trStm are the LAST COMMITTED position only. They must not be
+    // overwritten by an uncommitted observation.
+    bool trHave = false; chess::Board trPrev; char trStm = 'w'; bool trWb = true;
+    std::string lastTurnLog;
+
+    StableState stable;
+    PendingState pending;
 
     auto setSf = [&](const std::string& s) { std::lock_guard<std::mutex> lk(S.m); S.sfStatus = s; };
     auto startEngine = [&](const Settings& c) -> bool {
@@ -310,68 +405,20 @@ static void worker() {
         bool due = c.autoAnalyze && now >= nextScan;
         if (!(due || scanNow || reanalyze || learn)) { usleep(25000); continue; }
         nextScan = now + (uint64_t)(c.scanInterval * 1000);
-        if (reanalyze) { scanNow = true; }
 
         ScanOut so = scanOnce(cx, c, learn);
         now = nowMs();
-        if (so.ok) {
-            // ---- side to move. AUTO: whoever just moved is the side whose pieces appeared on changed squares.
-            char stm; std::string how;
-            if (c.sideToMove >= 0) { stm = c.sideToMove ? 'b' : 'w'; how = "manual"; }
-            else if (!trHave) {
-                // At startup there may be no move history.  For a normal game
-                // position the only reliable visual clue is board orientation:
-                // the player whose pieces are at the bottom is the player to
-                // move when we first see the position after the opponent's move.
-                // Keep the standard initial position as the special case: White
-                // always moves first.
-                if (so.board == chess::startBoard()) {
-                    stm = 'w';
-                    how = "first position: standard start -> white";
-                } else {
-                    stm = so.wb ? 'w' : 'b';
-                    how = so.wb ? "first position: white-bottom -> white"
-                                 : "first position: black-bottom -> black";
-                }
-                LOG("startup side-to-move inference: stm=%c orientation=%s", stm, so.wb ? "white-bottom" : "black-bottom");
-            } else if (so.board == trPrev) { stm = trStm; how = "unchanged"; }
-            else {
-                int wn = 0, bn = 0;
-                for (int i = 0; i < 64; i++)
-                    if (so.board.sq[i] != trPrev.sq[i] && so.board.sq[i] != '.') (chess::isWhite(so.board.sq[i]) ? wn : bn)++;
-                if (wn && !bn) { stm = 'b'; how = "white just moved"; }
-                else if (bn && !wn) { stm = 'w'; how = "black just moved"; }
-                else { stm = trStm; how = "several moves since last scan, kept"; }
-            }
-            std::string why;
-            if (!chess::validateFull(so.board, stm, why)) {
-                char alt = stm == 'w' ? 'b' : 'w'; std::string why2;
-                if (c.sideToMove < 0 && chess::validateFull(so.board, alt, why2)) { stm = alt; how += "; flipped because the other side was illegal"; }
-                else { so.ok = false; so.why = "POSITION INVALID (not analysed): " + why; }
-            }
-            if (so.ok) {
-                std::string cast = chess::sanitizeCastling(so.board, c.castling);
-                std::string ep = chess::sanitizeEp(so.board, stm, c.enPassant);
-                so.fen = chess::fen(so.board, stm, cast, ep);
-                trHave = true; trPrev = so.board; trStm = stm; trWb = so.wb;
-                std::string turn = std::string(stm == 'w' ? "WHITE" : "BLACK") + (c.sideToMove < 0 ? " (auto)" : " (manual)");
-                { std::lock_guard<std::mutex> lk(S.m); S.turn = turn; }
-                std::string tl = std::string("side to move: ") + (stm == 'w' ? "white" : "black") + " [" + how + "]";
-                if (turn != lastTurnLog) { LOG("%s", tl.c_str()); lastTurnLog = turn; }
-            }
-        }
-        {
-            std::lock_guard<std::mutex> lk(S.m);
-            S.scans++; S.learned = cx.rec.learned();
-            if (so.imgW) { S.imgW = so.imgW; S.imgH = so.imgH; }
-        }
+
+        // Side-to-move for this observation. It is copied into pending/stable
+        // state only after the FEN has passed validation.
+        char observationStm = 'w';
 
         // ---- temporal recovery
-        // If the current frame has a few unreadable squares, do not throw away the game state.
-        // First see whether all recognised squares still agree with the previous position. If not,
-        // ask chess_core to find the unique legal one-move transition that agrees with every
-        // recognised square. This handles highlights/animations on the source/destination squares
-        // and does not assume that the move was the engine's suggestion.
+        // If the current frame has a few unreadable squares, do not throw away the
+        // last COMMITTED state. Recovery is still only the existing one-ply helper;
+        // multi-ply reconciliation is deliberately deferred to the next patch.
+        bool recoveredFrame = false;
+        char recoveredStmHint = '\0';
         if (!so.ok && trHave && so.hasPartial && so.unknown <= 6) {
             chess::Board partial = vision::gridToBoard(so.grid, trWb);
             bool known[64] = {};
@@ -390,81 +437,252 @@ static void worker() {
                 so.board = recovered;
                 so.wb = trWb;
                 so.ok = true;
+                recoveredFrame = true;
+                recoveredStmHint = same ? trStm : (trStm == 'w' ? 'b' : 'w');
                 LOG("vision recovery: %s (unknown=%d)", rw.c_str(), so.unknown);
             }
+        }
+
+        // ---- resolve the observation's side-to-move and build its FEN
+        // This remains the existing AUTO heuristic for now. Correct multi-ply
+        // transition/turn inference is intentionally deferred to the next patch.
+        if (so.ok) {
+            char stm; std::string how;
+            if (c.sideToMove >= 0) {
+                stm = c.sideToMove ? 'b' : 'w';
+                how = "manual";
+            } else if (recoveredFrame) {
+                stm = recoveredStmHint;
+                how = "recovered from last committed position";
+            } else if (!trHave) {
+                if (so.board == chess::startBoard()) {
+                    stm = 'w';
+                    how = "first position: standard start -> white";
+                } else {
+                    stm = so.wb ? 'w' : 'b';
+                    how = so.wb ? "first position: white-bottom -> white"
+                                 : "first position: black-bottom -> black";
+                }
+                LOG("startup side-to-move inference: stm=%c orientation=%s", stm, so.wb ? "white-bottom" : "black-bottom");
+            } else if (so.board == trPrev) {
+                stm = trStm; how = "unchanged";
+            } else {
+                int wn = 0, bn = 0;
+                for (int i = 0; i < 64; i++)
+                    if (so.board.sq[i] != trPrev.sq[i] && so.board.sq[i] != '.')
+                        (chess::isWhite(so.board.sq[i]) ? wn : bn)++;
+                if (wn && !bn) { stm = 'b'; how = "white just moved"; }
+                else if (bn && !wn) { stm = 'w'; how = "black just moved"; }
+                else { stm = trStm; how = "several moves since last scan, kept"; }
+            }
+
+            std::string why;
+            if (!chess::validateFull(so.board, stm, why)) {
+                char alt = stm == 'w' ? 'b' : 'w'; std::string why2;
+                if (c.sideToMove < 0 && chess::validateFull(so.board, alt, why2)) {
+                    stm = alt; how += "; flipped because the other side was illegal";
+                } else {
+                    so.ok = false;
+                    so.why = "POSITION INVALID (not analysed): " + why;
+                }
+            }
+            if (so.ok) {
+                std::string cast = chess::sanitizeCastling(so.board, c.castling);
+                std::string ep = chess::sanitizeEp(so.board, stm, c.enPassant);
+                so.fen = chess::fen(so.board, stm, cast, ep);
+                observationStm = stm;
+            }
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(S.m);
+            S.scans++; S.learned = cx.rec.learned();
+            if (so.imgW) { S.imgW = so.imgW; S.imgH = so.imgH; }
         }
 
         if (!so.ok) {
             logChange(lastFail, so.why);
             std::lock_guard<std::mutex> lk(S.m);
-            bool fresh = S.lastGoodMs && (now - S.lastGoodMs) < HOLD_MS;
+            bool fresh = stable.have && stable.fen == S.fen && stable.have &&
+                         S.lastGoodMs && (now - S.lastGoodMs) < HOLD_MS;
             if (fresh) S.scanStatus = so.why + "  [holding last position]";
             else {
                 S.scanStatus = so.why;
-                if (S.bdValid || !S.bm.empty()) LOG("scan: lost position for >%llus: %s", (unsigned long long)(HOLD_MS / 1000), so.why.c_str());
+                if (S.bdValid || !S.bm.empty())
+                    LOG("scan: lost position for >%llus: %s", (unsigned long long)(HOLD_MS / 1000), so.why.c_str());
                 S.bdValid = false; S.bm.clear(); S.ev.clear(); S.pv.clear();
             }
-            if (so.bdFound && fresh) { S.bd = so.bd; }   // keep tracking the board rectangle
-            wasGood = false; candCount = 0;
+            if (so.bdFound && fresh) { S.bd = so.bd; }
+            pending.have = false; pending.count = 0;
             continue;
         }
         lastFail.clear();
 
-        // good frame: publish geometry; require the same FEN on consecutive scans (filters piece animations)
-        {
+        // ---- stable-state gate
+        // A matching observation of the already committed FEN is immediately
+        // considered confirmation of that committed state. A NEW FEN must be
+        // observed on two consecutive valid scans before it can be committed.
+        bool committedThisScan = false;
+        bool sameAsStable = stable.have && so.fen == stable.fen;
+
+        if (sameAsStable) {
+            pending.have = false; pending.count = 0;
+            {
+                std::lock_guard<std::mutex> lk(S.m);
+                S.scanStatus = "BOARD OK";
+                S.lastGoodMs = now;
+                // Geometry is still allowed to follow the existing tracker here;
+                // board/orientation locking is intentionally deferred.
+                S.bd = so.bd; S.bdValid = true; S.wb = so.wb;
+            }
+        } else {
+            if (!pending.have || pending.fen != so.fen) {
+                pending.have = true;
+                pending.fen = so.fen;
+                pending.board = so.board;
+                pending.stm = (so.fen.find(" b ") != std::string::npos) ? 'b' : 'w';
+                pending.wb = so.wb;
+                pending.bd = so.bd;
+                pending.imgW = so.imgW; pending.imgH = so.imgH;
+                pending.turn = pending.stm == 'w' ? "WHITE" : "BLACK";
+                if (c.sideToMove < 0) pending.turn += " (auto)";
+                else pending.turn += " (manual)";
+                pending.count = 1;
+            } else {
+                pending.count++;
+                // Keep metadata from the newest matching frame.
+                pending.board = so.board;
+                pending.wb = so.wb;
+                pending.bd = so.bd;
+                pending.imgW = so.imgW; pending.imgH = so.imgH;
+                pending.stm = (so.fen.find(" b ") != std::string::npos) ? 'b' : 'w';
+            }
+
             std::lock_guard<std::mutex> lk(S.m);
-            S.bd = so.bd; S.bdValid = true; S.wb = so.wb; S.lastGoodMs = now; S.fen = so.fen;
-            S.scanStatus = "BOARD OK";
+            S.scanStatus = "BOARD CANDIDATE " + std::to_string(pending.count) + "/2 [holding last position]";
         }
-        if (so.fen == candFen) candCount++; else { candFen = so.fen; candCount = 1; }
-        int need = (scanNow || reanalyze) ? 1 : 2;
-        bool changed = so.fen != analyzedFen || c.depth != analyzedDepth;
-        if (!wasGood || so.fen != lastFenLog) {
-            if (so.fen != lastFenLog) LOG("recognized FEN: %s (orientation=%s)", so.fen.c_str(), so.wb ? "white-bottom" : "black-bottom");
-            lastFenLog = so.fen;
+
+        if (!sameAsStable && pending.have && pending.count >= 2) {
+            stable.have = true;
+            stable.fen = pending.fen;
+            stable.board = pending.board;
+            stable.stm = pending.stm;
+            stable.wb = pending.wb;
+            stable.bd = pending.bd;
+            stable.imgW = pending.imgW; stable.imgH = pending.imgH;
+            stable.turn = pending.turn;
+
+            trHave = true;
+            trPrev = stable.board;
+            trStm = stable.stm;
+            trWb = stable.wb;
+
+            committedThisScan = true;
+            pending.have = false;
+            pending.count = 0;
+
+            const std::string tl = "side to move: " +
+                                   std::string(stable.stm == 'w' ? "white" : "black") +
+                                   " [" + (c.sideToMove < 0 ? "stable auto" : "manual") + "]";
+            if (tl != lastTurnLog) { LOG("%s", tl.c_str()); lastTurnLog = tl; }
+
+            if (stable.fen != analyzedFen) {
+                std::lock_guard<std::mutex> lk(S.m);
+                S.bm.clear(); S.ev.clear(); S.pv.clear();
+            }
+            {
+                std::lock_guard<std::mutex> lk(S.m);
+                S.bd = stable.bd; S.bdValid = true; S.wb = stable.wb;
+                if (stable.imgW) { S.imgW = stable.imgW; S.imgH = stable.imgH; }
+                S.lastGoodMs = now;
+                S.fen = stable.fen;
+                S.turn = stable.turn;
+                S.scanStatus = "BOARD STABLE";
+            }
+            if (stable.fen != lastFenLog) {
+                LOG("stable FEN committed: %s (orientation=%s)",
+                    stable.fen.c_str(), stable.wb ? "white-bottom" : "black-bottom");
+                lastFenLog = stable.fen;
+            }
         }
-        wasGood = true;
-        if (!(changed || reanalyze) || candCount < need) continue;
+
+        // An unchanged committed position simply refreshes its hold timer; its
+        // board/FEN/arrow are never replaced by the current observation.
+
+        // ---- analysis only consumes the COMMITTED stable FEN.
+        if (!stable.have) continue;
+        bool changed = stable.fen != analyzedFen || c.depth != analyzedDepth;
+        if (!(changed || reanalyze)) continue;
+
+        std::string fenWhy;
+        if (!chess::validateFull(stable.board, stable.stm, fenWhy)) {
+            setSf("STOCKFISH: REFUSED INVALID POSITION: " + fenWhy);
+            LOG("engine boundary: refused unstable/invalid committed board: %s", fenWhy.c_str());
+            continue;
+        }
+        if (!engineFenLooksUsable(stable.fen, fenWhy)) {
+            setSf("STOCKFISH: REFUSED INVALID FEN: " + fenWhy);
+            LOG("engine boundary: refused FEN: %s | %s", stable.fen.c_str(), fenWhy.c_str());
+            continue;
+        }
+
+        // Avoid hammering the same failed request every scan. A new FEN or depth,
+        // or an explicit REANALYZE, bypasses this short backoff.
+        now = nowMs();
+        if (!reanalyze && stable.fen == lastAttemptedFen &&
+            c.depth == lastAttemptedDepth && now < engineRetryAt) {
+            continue;
+        }
 
         // ---- analysis
-        if (so.fen != analyzedFen) { std::lock_guard<std::mutex> lk(S.m); S.bm.clear(); S.ev.clear(); S.pv.clear(); }
         if (!eng.running()) {
-            if (now < engineRetryAt && !reanalyze) { setSf("STOCKFISH: ERROR: engine down, retrying"); continue; }
+            if (now < engineRetryAt && !reanalyze) {
+                setSf("STOCKFISH: ERROR: engine down, retrying");
+                continue;
+            }
             LOG("stockfish: engine not running, restarting");
             if (!startEngine(c)) { engineRetryAt = nowMs() + 3000; continue; }
         }
         setSf("STOCKFISH: ANALYZING");
-        const char fenStm = (so.fen.find(" b ") != std::string::npos) ? 'b' : 'w';
-        LOG("analysis start: depth=%d stm=%c fen=%s", c.depth, fenStm, so.fen.c_str());
+        const char fenStm = stable.stm;
+        LOG("analysis start: depth=%d stm=%c fen=%s", c.depth, fenStm, stable.fen.c_str());
+        lastAttemptedFen = stable.fen;
+        lastAttemptedDepth = c.depth;
         uint64_t t0 = nowMs();
-        // Depth searches on ARM64 can legitimately take longer than the old
-        // 15s + depth watchdog.  The engine itself now stops cleanly and can
-        // return the best move it has found so far, so this is only a hard
-        // safety watchdog rather than the normal search deadline.
         int sfTimeout = std::max(60000, 30000 + c.depth * 3000);
-        sf::Result r = eng.analyze(so.fen, fenStm, c.depth, sfTimeout);
+        sf::Result r = eng.analyze(stable.fen, fenStm, c.depth, sfTimeout);
         uint64_t dt = nowMs() - t0;
+
         if (r.ok && !r.bestmove.empty()) {
-            LOG("bestmove %s eval=%s depth=%d (%llu ms) pv=%s", r.bestmove.c_str(), r.eval.c_str(), r.depth, (unsigned long long)dt, r.pv.c_str());
-            { std::lock_guard<std::mutex> lk(S.m); S.bm = r.bestmove; S.ev = r.eval; S.pv = r.pv; S.evalDepth = r.depth; S.analyses++; S.sfStatus = "STOCKFISH: BESTMOVE " + r.bestmove; }
-            analyzedFen = so.fen; analyzedDepth = c.depth;
-            writeState(so.bd, so.fen, r.bestmove, r.eval, r.depth, true, "");
+            LOG("bestmove %s eval=%s depth=%d (%llu ms) pv=%s",
+                r.bestmove.c_str(), r.eval.c_str(), r.depth,
+                (unsigned long long)dt, r.pv.c_str());
+            {
+                std::lock_guard<std::mutex> lk(S.m);
+                S.bm = r.bestmove; S.ev = r.eval; S.pv = r.pv;
+                S.evalDepth = r.depth; S.analyses++;
+                S.sfStatus = "STOCKFISH: BESTMOVE " + r.bestmove;
+            }
+            analyzedFen = stable.fen; analyzedDepth = c.depth; engineRetryAt = 0;
+            writeState(stable.bd, stable.fen, r.bestmove, r.eval, r.depth, true, "");
         } else if (r.ok) {
             LOG("analysis: %s", r.err.c_str());
-            { std::lock_guard<std::mutex> lk(S.m); S.sfStatus = "STOCKFISH: NO LEGAL MOVES"; }
-            analyzedFen = so.fen; analyzedDepth = c.depth;
-            writeState(so.bd, so.fen, "", "", 0, false, r.err);
+            {
+                std::lock_guard<std::mutex> lk(S.m);
+                S.sfStatus = "STOCKFISH: NO LEGAL MOVES";
+            }
+            analyzedFen = stable.fen; analyzedDepth = c.depth; engineRetryAt = 0;
+            writeState(stable.bd, stable.fen, "", "", 0, false, r.err);
         } else {
-            LOG("analysis %s: %s (%llu ms)", r.timeout ? "TIMEOUT" : "ERROR", r.err.c_str(), (unsigned long long)dt);
+            LOG("analysis %s: %s (%llu ms)",
+                r.timeout ? "TIMEOUT" : "ERROR", r.err.c_str(), (unsigned long long)dt);
             setSf(r.timeout ? "STOCKFISH: SEARCH TIMEOUT" : "STOCKFISH: ERROR: " + r.err);
-            // analyze() only returns here without a move when the engine could
-            // not be recovered. Do not tear down a healthy engine just because
-            // the watchdog fired; the next scan can reuse it.
+            engineRetryAt = nowMs() + 2000;
             if (!eng.running()) {
                 LOG("stockfish: engine is actually down after analysis failure");
                 engineRetryAt = nowMs() + 1000;
             }
-            writeState(so.bd, so.fen, "", "", 0, false, r.err);
+            writeState(stable.bd, stable.fen, "", "", 0, false, r.err);
         }
     }
     eng.stop();
