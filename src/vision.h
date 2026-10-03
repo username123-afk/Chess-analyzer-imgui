@@ -36,8 +36,14 @@ struct SqFeat {
     float lum = 0;                 // median luminance of piece interior
     float aspect = 1, hfrac = 0;   // bbox aspect and height as fraction of square
     float mask[TG * TG];
+    // Diagnostics only (never used for classification): size of the chosen component in working-grid
+    // cells, its bounding box, and the estimated square background colour.
+    int area = 0, bw = 0, bh = 0;
+    float bg[3] = {0, 0, 0};
 };
-SqFeat analyzeSquare(const Image& im, float x0, float y0, float s);
+// fgThr: a cell counts as piece foreground when its colour is further than this (sum of |dR|+|dG|+|dB|)
+// from the square background. 120 is the normal value; recognize() uses a lower one only as a fallback.
+SqFeat analyzeSquare(const Image& im, float x0, float y0, float s, float fgThr = 120.f);
 
 struct Sample { float mask[TG * TG]; float aspect, hfrac; };
 
@@ -66,6 +72,12 @@ public:
     float repairMinDist = 0.30f;  // repair only when maxDist >= this (the 0.32 pass)
     float repairMaxD = 0.85f;     // best template distance above this = garbage, never repaired
     int repairMaxDiff = 8;        // reference is stale if more squares than this differ from it
+
+    // Unknown-square fallback (see recognize()). Re-analyses ONLY squares still unknown after normal
+    // recognition, at a lower foreground threshold, on the loose retry pass. Never touches maxDist.
+    float fallbackMinDist = 0.30f;  // fallback only runs when maxDist >= this (the 0.32 pass)
+    float fallbackFgThr = 80.f;     // foreground threshold for the second analysis (normal is 120)
+    float fallbackMargin = 0.10f;   // best same-colour template must beat the 2nd best by at least this
 private:
     void resetStable() const;
     void commitStable(const char g[64]) const;
@@ -74,6 +86,10 @@ private:
     mutable int pendCount_ = 0;
     mutable bool haveRef_ = false;
     mutable int lastRepairSq_ = -1;
+    // log throttling (seconds on a monotonic clock; 0 = never logged) and repairs since the last log line
+    mutable double repairLogT_[64] = {};
+    mutable int repairSince_[64] = {};
+    mutable double diagLogT_[64] = {};
 
     std::vector<Sample> samples_[12];  // index into "PNBRQKpnbrqk"
     float lumThr_ = 128;

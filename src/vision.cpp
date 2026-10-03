@@ -2,6 +2,7 @@
 #include "log.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -14,6 +15,9 @@ static const char* kPieces = "PNBRQKpnbrqk";
 static int pieceIndex(char c) {
     const char* p = strchr(kPieces, c);
     return p ? (int)(p - kPieces) : -1;
+}
+static double nowSec() {   // monotonic seconds, only used to throttle log lines
+    return std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count();
 }
 
 // ---------------------------------------------------------------- screencap parsing
@@ -228,7 +232,7 @@ bool verifyBoard(const Image& im, BoardDetect& bd) {
 }
 
 // ---------------------------------------------------------------- per-square analysis
-SqFeat analyzeSquare(const Image& im, float x0, float y0, float s) {
+SqFeat analyzeSquare(const Image& im, float x0, float y0, float s, float fgThr) {
     SqFeat f;
     memset(f.mask, 0, sizeof(f.mask));
     const int N = MG;
@@ -268,12 +272,13 @@ SqFeat analyzeSquare(const Image& im, float x0, float y0, float s) {
             }
         }
     for (int c = 0; c < 3; c++) bg[c] /= std::max(1, bn);
+    for (int c = 0; c < 3; c++) f.bg[c] = bg[c];
 
     static thread_local uint8_t fg[N * N], outside[N * N], reg[N * N];
     static thread_local int stack[N * N], comp[N * N], best[N * N];
     for (int c = 0; c < N * N; c++) {
         float d = std::fabs(col[c][0] - bg[0]) + std::fabs(col[c][1] - bg[1]) + std::fabs(col[c][2] - bg[2]);
-        fg[c] = d > 120.f;
+        fg[c] = d > fgThr;
         int cx = c % N, cy = c / N;
         if (std::min(std::min(cx, cy), std::min(N - 1 - cx, N - 1 - cy)) < 2) fg[c] = 0;   // margin: ignore neighbour bleed
     }
@@ -313,6 +318,7 @@ SqFeat analyzeSquare(const Image& im, float x0, float y0, float s) {
         }
         if (n > bestN) { bestN = n; memcpy(best, comp, n * sizeof(int)); }
     }
+    f.area = bestN;
     if (bestN < 48) { f.empty = true; return f; }
     f.empty = false;
     if (bestN > 1100) { f.bad = true; return f; }
@@ -343,6 +349,7 @@ SqFeat analyzeSquare(const Image& im, float x0, float y0, float s) {
     f.lum = L[L.size() / 2];
 
     float bw = (float)(maxx - minx + 1), bh = (float)(maxy - miny + 1);
+    f.bw = maxx - minx + 1; f.bh = maxy - miny + 1;
     f.aspect = bw / bh;
     f.hfrac = bh / N;
     for (int v = 0; v < TG; v++)
@@ -426,6 +433,8 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
         bool white = true;
         float d[6];
         int best = -1;
+        int area = 0, bw = 0, bh = 0;   // diagnostics for the unknown-square log
+        float bg[3] = {0, 0, 0};
     } cand[64];
 
     float s = size / 8.f;
@@ -435,6 +444,8 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
             SqFeat f = analyzeSquare(im, bx + c * s, by + r * s, s);
             if (f.empty) continue;
             cand[si].occupied = true;
+            cand[si].area = f.area; cand[si].bw = f.bw; cand[si].bh = f.bh;
+            for (int k = 0; k < 3; k++) cand[si].bg[k] = f.bg[k];
             if (f.bad) { cand[si].bad = true; continue; }
 
             bool white = f.lum > lumThr_;
@@ -487,6 +498,84 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
                 }
                 if (bj >= 0 && best <= maxDist) rr.grid[i] = kPieces[lo + bj];
                 else rr.grid[i] = '.';
+            }
+        }
+    }
+
+    // Unknown-square fallback. Only on the loose retry pass (like the repair below), so every frame the
+    // normal path resolves is resolved exactly as before, and maxDist is never touched. A square that is
+    // still unknown here is analysed a second time at a lower foreground threshold. Mid-grey piece bodies
+    // (the black pieces in this theme) sit only ~100 from a plain dark-square background, below the normal
+    // threshold of 120, so on those squares only the thin outline is foreground and the mask is hollow. The
+    // second analysis is accepted only if it is not bad, keeps the colour, its best same-colour template is
+    // within the normal maxDist and beats the runner-up by fallbackMargin, and it does not create a 2nd king.
+    if (maxDist >= fallbackMinDist) {
+        for (int i = 0; i < 64; i++) {
+            if (!cand[i].occupied || cand[i].bad || rr.grid[i] != '.') continue;
+            const int lo = cand[i].white ? 0 : 6;
+            const char* nm = kPieces + lo;
+
+            // first-pass numbers, for the log
+            int a1 = -1, a2 = -1;
+            for (int j = 0; j < 6; j++) if (a1 < 0 || cand[i].d[j] < cand[i].d[a1]) a1 = j;
+            for (int j = 0; j < 6; j++) if (j != a1 && (a2 < 0 || cand[i].d[j] < cand[i].d[a2])) a2 = j;
+            auto fill = [](int area, int w, int h) { return w * h > 0 ? (float)area / (float)(w * h) : 0.f; };
+
+            SqFeat g = analyzeSquare(im, bx + (i % 8) * s, by + (i / 8) * s, s, fallbackFgThr);
+            float d2[6] = {1e9f, 1e9f, 1e9f, 1e9f, 1e9f, 1e9f};
+            int b1 = -1, b2 = -1;
+            const char* verdict = nullptr;
+            if (g.empty) verdict = "reject: empty at fallback threshold";
+            else if (g.bad) verdict = "reject: bad (overlay/highlight)";
+            else if ((g.lum > lumThr_) != cand[i].white) verdict = "reject: colour changed";
+            else {
+                for (int j = 0; j < 6; j++) {
+                    float bd = 1e9f;
+                    for (const Sample& smp : samples_[lo + j]) bd = std::min(bd, sampleDist(g, smp));
+                    d2[j] = bd;
+                }
+                for (int j = 0; j < 6; j++) if (b1 < 0 || d2[j] < d2[b1]) b1 = j;
+                for (int j = 0; j < 6; j++) if (j != b1 && (b2 < 0 || d2[j] < d2[b2])) b2 = j;
+                if (b1 < 0 || d2[b1] >= 1e8f) verdict = "reject: no valid classification";
+                else if (d2[b1] > maxDist) verdict = "reject: best distance > maxDist";
+                else if (d2[b2] - d2[b1] < fallbackMargin) verdict = "reject: margin to 2nd best too small";
+                else {
+                    bool secondKing = false;
+                    if (b1 == 5) for (int k = 0; k < 64; k++) if (rr.grid[k] == kPieces[lo + 5]) secondKing = true;
+                    if (secondKing) verdict = "reject: would be a 2nd king";
+                }
+            }
+            const bool accept = verdict == nullptr;
+
+            if (diagLogT_[i] == 0 || nowSec() - diagLogT_[i] >= 2.0) {
+                diagLogT_[i] = nowSec();
+                char t[640];
+                int n = snprintf(t, sizeof t,
+                    "recognition: unknown r%dc%d %s: fg=120 bestN=%d bbox=%dx%d fill=%.2f bg=(%.0f,%.0f,%.0f) "
+                    "d[%c%c%c%c%c%c]=%.2f/%.2f/%.2f/%.2f/%.2f/%.2f best=%c:%.2f 2nd=%c:%.2f",
+                    i / 8 + 1, i % 8 + 1, cand[i].white ? "white" : "black", cand[i].area, cand[i].bw, cand[i].bh,
+                    fill(cand[i].area, cand[i].bw, cand[i].bh), cand[i].bg[0], cand[i].bg[1], cand[i].bg[2],
+                    nm[0], nm[1], nm[2], nm[3], nm[4], nm[5],
+                    cand[i].d[0], cand[i].d[1], cand[i].d[2], cand[i].d[3], cand[i].d[4], cand[i].d[5],
+                    nm[a1], cand[i].d[a1], nm[a2], cand[i].d[a2]);
+                if (n > 0 && n < (int)sizeof t) {
+                    if (g.empty || g.bad || b1 < 0)
+                        snprintf(t + n, sizeof t - n, " | fallback fg=%.0f bestN=%d -> %s", fallbackFgThr, g.area, verdict);
+                    else
+                        snprintf(t + n, sizeof t - n,
+                            " | fallback fg=%.0f bestN=%d bbox=%dx%d fill=%.2f d=%.2f/%.2f/%.2f/%.2f/%.2f/%.2f best=%c:%.3f 2nd=%c:%.3f margin=%.3f -> %s",
+                            fallbackFgThr, g.area, g.bw, g.bh, fill(g.area, g.bw, g.bh),
+                            d2[0], d2[1], d2[2], d2[3], d2[4], d2[5],
+                            nm[b1], d2[b1], nm[b2], d2[b2], d2[b2] - d2[b1],
+                            accept ? "ACCEPT" : verdict);
+                }
+                LOG("%s", t);
+            }
+
+            if (accept) {
+                rr.grid[i] = kPieces[lo + b1];
+                for (int j = 0; j < 6; j++) cand[i].d[j] = d2[j];   // the count loop below re-checks this square
+                cand[i].best = b1;
             }
         }
     }
@@ -568,7 +657,14 @@ RecogResult Recognizer::recognize(const Image& im, float bx, float by, float siz
             snprintf(t, sizeof t, "r%dc%d kept '%c' from last stable board (d=%.2f, %d other squares differ)",
                      u / 8 + 1, u % 8 + 1, rp, best, diff);
             rr.repairNote = t;
-            if (lastRepairSq_ != u) { LOG("recognition: repair: %s", t); lastRepairSq_ = u; }
+            // log every repair, throttled to once per 5 s per square (with a count of repairs since the last line)
+            repairSince_[u]++;
+            double now = nowSec();
+            if (repairLogT_[u] == 0 || now - repairLogT_[u] >= 5.0) {
+                LOG("recognition: repair: %s [%d repair(s) of this square since last log]", t, repairSince_[u]);
+                repairLogT_[u] = now; repairSince_[u] = 0;
+            }
+            lastRepairSq_ = u;
         }
     }
 
